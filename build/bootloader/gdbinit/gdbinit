@@ -1,0 +1,2 @@
+source /home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/bootloader/gdbinit/symbols
+source /home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/bootloader/gdbinit/connect

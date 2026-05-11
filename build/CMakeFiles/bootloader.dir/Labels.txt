@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/CMakeFiles/bootloader
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/CMakeFiles/bootloader.rule
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/CMakeFiles/bootloader-complete.rule
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

@@ -1,0 +1,9 @@
+Command: cmake -G Ninja -B /home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32/build -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/home/jm/.espressif/tools/python/v6.0/venv/bin/python3 -DESP_PLATFORM=1 -DIDF_TARGET=esp32 -DCCACHE_ENABLE=False /home/jm/Documents/PLANTAGOCHI_197/plantagochi-esp32
+Configuration Report               
+ ───────────────────────────────── 
+   Parser Version: 1               
+   Verbosity: default              
+   Defaults policy: sdkconfig      
+   Status: Finished successfully   
+                                   
+ ───────────────────────────────── 
