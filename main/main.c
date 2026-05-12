@@ -1,15 +1,13 @@
 /*
  * Plantagochi — ESP32-WROOM-32 Firmware (ESP-IDF 5.x)
  *
- * Starts a Wi-Fi Access Point, serves a browser dashboard on port 80,
- * reads water level / TDS / pH sensors, and controls pump relays and
- * a DC motor (pH adjustment) via HTTP endpoints.
+ * Starts a Wi-Fi Access Point and serves a browser dashboard on port 80.
+ * Reads three sensors and drives three output buttons via HTTP.
  *
  * Endpoints:
- *   GET /          → serves the HTML dashboard
- *   GET /data      → returns { "water": %, "food": ppm, "ph": value }
- *   GET /action    → triggers water / nutrient / pH pump
- *   GET /motor     → direct motor control: ?cmd=forward|backward|stop  ?speed=0-255
+ *   GET /       — serves the HTML dashboard
+ *   GET /data   — returns { "water": %, "food": ppm, "ph": value }
+ *   GET /action — triggers water / nutrient / pH pump
  *
  * Flash steps:
  *   1. Set WIFI_SSID, WIFI_PASSWORD, and LAPTOP_IP below.
@@ -20,18 +18,20 @@
  *   5. Connect to Wi-Fi PLANTAGOCHI, open http://192.168.4.1
  *   6. On your laptop: source venv/bin/activate && python server.py
  *
- * Pin assignments (ESP32-WROOM-32):
+ * ----------------------------------------------------------------
+ * SENSORS (inputs)
  *   GPIO 34 — Water level sensor  (ADC1_CH6)
  *   GPIO 32 — pH sensor           (ADC1_CH4)
- *   GPIO 21 — I2C SDA → ADS1115 (TDS)
- *   GPIO 22 — I2C SCL → ADS1115 (TDS)
- *   GPIO 25 — Water pump relay
- *   GPIO 26 — Nutrient pump relay
- *   GPIO 27 — DC motor IN1 (pH adjustment, L298N)
- *   GPIO 33 — DC motor IN2
- *   GPIO 14 — DC motor ENA (PWM)
+ *   GPIO 21 — I2C SDA → ADS1115  (TDS/Nutrients)
+ *   GPIO 22 — I2C SCL → ADS1115  (TDS/Nutrients)
  *
- * Avoid: GPIO 0 (boot), GPIO 12 (flash voltage), ADC2 pins (Wi-Fi conflict)
+ * BUTTON OUTPUTS
+ *   GPIO 25 — Add Water  button → water pump relay
+ *   GPIO 26 — Feed Plant button → nutrient pump relay
+ *   GPIO 27 — Fix pH     button → L298N IN1  (motor direction)
+ *   GPIO 33 — Fix pH     button → L298N IN2  (motor direction)
+ *   GPIO 14 — Fix pH     button → L298N ENA  (motor speed, PWM)
+ * ----------------------------------------------------------------
  */
 
 #include <string.h>
@@ -66,6 +66,28 @@
 
 /* 1 = fake sensor data for testing, 0 = real sensors */
 #define SIMULATE_SENSORS 1
+
+/* ----------------------------------------------------------------
+   PUMP / MOTOR ON DURATIONS
+   Controls how long each output stays active when its button is pressed.
+   Change any value here — no need to touch the rest of the code.
+
+   WATER_ON_DURATION_MS  — Add Water  button (GPIO 25 relay)
+   FOOD_ON_DURATION_MS   — Feed Plant button (GPIO 26 relay)
+   PH_ON_DURATION_MS     — Fix pH     button (GPIO 27 motor IN1)
+   ---------------------------------------------------------------- */
+#define WATER_ON_DURATION_MS  10000   /* milliseconds — 10 s default */
+#define FOOD_ON_DURATION_MS   10000   /* milliseconds — 10 s default */
+#define PH_ON_DURATION_MS     10000   /* milliseconds — 10 s default */
+
+/* ----------------------------------------------------------------
+   TEST_GPIO27
+   1 = run the GPIO 27 LED blink test instead of normal firmware
+   0 = normal Plantagochi operation (leave this at 0 when done)
+
+   Circuit: GPIO 27 ──── 330Ω ──── LED(+) ──── LED(–) ──── GND
+   ---------------------------------------------------------------- */
+#define TEST_GPIO27 0
 
 /* ----------------------------------------------------------------
    PIN DEFINITIONS
@@ -1162,17 +1184,25 @@ static const char HTML_PAGE[] =
 "  btn.disabled = true; btn.dataset.state = \"loading\";\n"
 "  btn.innerHTML = '<span class=\"pump-btn-icon\">⏳</span> Running…';\n"
 "  spawnParticles(pt);\n"
-"  fetch(esp32_base_url + \"/action?action=\" + action).catch(function(){}).finally(function() {\n"
-"    setTimeout(function() {\n"
-"      btn.dataset.state = \"done\";\n"
-"      btn.innerHTML = '<span class=\"pump-btn-icon\">✅</span> Done!';\n"
+"  fetch(esp32_base_url + \"/action?action=\" + action)\n"
+"    .then(function(r) { return r.json(); })\n"
+"    .then(function(d) {\n"
+"      var duration = d.duration || 3000;\n"
 "      setTimeout(function() {\n"
-"        btn.dataset.state = \"idle\";\n"
-"        btn.innerHTML = '<span class=\"pump-btn-icon\">' + icon + '</span> ' + label;\n"
-"        btn.disabled = false;\n"
-"      }, 900);\n"
-"    }, 1200);\n"
-"  });\n"
+"        btn.dataset.state = \"done\";\n"
+"        btn.innerHTML = '<span class=\"pump-btn-icon\">✅</span> Done!';\n"
+"        setTimeout(function() {\n"
+"          btn.dataset.state = \"idle\";\n"
+"          btn.innerHTML = '<span class=\"pump-btn-icon\">' + icon + '</span> ' + label;\n"
+"          btn.disabled = false;\n"
+"        }, 900);\n"
+"      }, duration);\n"
+"    })\n"
+"    .catch(function() {\n"
+"      btn.dataset.state = \"idle\";\n"
+"      btn.innerHTML = '<span class=\"pump-btn-icon\">' + icon + '</span> ' + label;\n"
+"      btn.disabled = false;\n"
+"    });\n"
 "}\n"
 "\n"
 "/* ══════════════════════════════════════════════\n"
@@ -1927,34 +1957,26 @@ static void motor_stop(void)
     ESP_LOGI(TAG, "Motor STOPPED");
 }
 
-/* pH action sequence: forward 2s → stop 1s → backward 2s → stop 1s → ramp up */
+/*
+ * motor_run_sequence()
+ * Called when Fix pH button is pressed.
+ *
+ * Currently: holds GPIO 27 HIGH for PH_ON_DURATION_MS then LOW.
+ * Simple and controllable — good for LED testing.
+ *
+ * When the real L298N motor is connected, replace the body with:
+ *   motor_forward(255);  vTaskDelay(pdMS_TO_TICKS(2000));
+ *   motor_stop();        vTaskDelay(pdMS_TO_TICKS(1000));
+ *   motor_backward(255); vTaskDelay(pdMS_TO_TICKS(2000));
+ *   motor_stop();
+ */
 static void motor_run_sequence(void)
 {
-    ESP_LOGI(TAG, "Motor sequence START");
-
-    motor_forward(255);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    motor_stop();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    motor_backward(255);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    motor_stop();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    /* Ramp from MOTOR_PWM_DEFAULT (200) to 255 in steps of 5, 500 ms each */
-    gpio_set_level(MOTOR_PIN_IN1, 0);
-    gpio_set_level(MOTOR_PIN_IN2, 1);
-    for (uint32_t duty = MOTOR_PWM_DEFAULT; duty <= 255; duty += 5) {
-        motor_set_speed(duty);
-        ESP_LOGI(TAG, "Motor ramp duty=%"PRIu32, duty);
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    motor_stop();
-
-    ESP_LOGI(TAG, "Motor sequence END");
+    ESP_LOGI(TAG, "pH: GPIO 27 HIGH for %d ms", PH_ON_DURATION_MS);
+    gpio_set_level(MOTOR_PIN_IN1, 1);           /* GPIO 27 → 3.3V, LED ON  */
+    vTaskDelay(pdMS_TO_TICKS(PH_ON_DURATION_MS));
+    gpio_set_level(MOTOR_PIN_IN1, 0);           /* GPIO 27 → 0V,   LED OFF */
+    ESP_LOGI(TAG, "pH: GPIO 27 LOW");
 }
 
 /* Configures GPIO 27 (IN1), GPIO 33 (IN2), and LEDC PWM on GPIO 14 (ENA). */
@@ -1970,6 +1992,10 @@ static void motor_init(void)
     gpio_config(&dir_conf);
     gpio_set_level(MOTOR_PIN_IN1, 0);
     gpio_set_level(MOTOR_PIN_IN2, 0);
+
+    /* Max drive strength — ensures GPIO 27 reaches full 3.3V output */
+    gpio_set_drive_capability(MOTOR_PIN_IN1, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(MOTOR_PIN_IN2, GPIO_DRIVE_CAP_3);
 
     ledc_timer_config_t timer_conf = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
@@ -2042,22 +2068,30 @@ static esp_err_t handler_data(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* GET /action?action=water|food|ph — enqueues a pump or motor job */
+/* GET /action?action=water|food|ph — enqueues a pump or motor job.
+   Returns {"ok":true,"duration":<ms>} so the HTML button stays in
+   "Running..." for exactly as long as the hardware actually runs. */
 static esp_err_t handler_action(httpd_req_t *req)
 {
     char param[32]  = {0};
     char action[16] = {0};
+    int32_t duration_to_report = 0;
 
     if (httpd_req_get_url_query_str(req, param, sizeof(param)) == ESP_OK) {
         if (httpd_query_key_value(param, "action", action, sizeof(action)) == ESP_OK) {
             pump_job_t job;
             if (strcmp(action, "water") == 0) {
-                job.pin = PIN_PUMP_WATER; job.duration_ms = 3000; snprintf(job.action, sizeof(job.action), "%s", "water");
+                job.pin = PIN_PUMP_WATER; job.duration_ms = WATER_ON_DURATION_MS;
+                snprintf(job.action, sizeof(job.action), "%s", "water");
+                duration_to_report = WATER_ON_DURATION_MS;
             } else if (strcmp(action, "food") == 0) {
-                job.pin = PIN_PUMP_NUTRIENT; job.duration_ms = 2000; snprintf(job.action, sizeof(job.action), "%s", "food");
+                job.pin = PIN_PUMP_NUTRIENT; job.duration_ms = FOOD_ON_DURATION_MS;
+                snprintf(job.action, sizeof(job.action), "%s", "food");
+                duration_to_report = FOOD_ON_DURATION_MS;
             } else if (strcmp(action, "ph") == 0) {
-                /* pin=0 is the sentinel that tells pump_worker to call motor_run_sequence() */
-                job.pin = 0; job.duration_ms = 0; snprintf(job.action, sizeof(job.action), "%s", "ph");
+                job.pin = 0; job.duration_ms = 0;
+                snprintf(job.action, sizeof(job.action), "%s", "ph");
+                duration_to_report = PH_ON_DURATION_MS;
             } else {
                 ESP_LOGW(TAG, "Unknown action: %s", action);
                 add_cors_headers(req);
@@ -2067,19 +2101,22 @@ static esp_err_t handler_action(httpd_req_t *req)
             }
 
             if (pump_queue == NULL || xQueueSend(pump_queue, &job, 0) != pdTRUE) {
-                ESP_LOGW(TAG, "Pump queue full or not available — action=%s", job.action);
+                ESP_LOGW(TAG, "Pump queue full \xe2\x80\x94 action=%s", job.action);
                 add_cors_headers(req);
                 httpd_resp_set_type(req, "application/json");
                 httpd_resp_send(req, "{\"ok\":false,\"error\":\"queue_full\"}", strlen("{\"ok\":false,\"error\":\"queue_full\"}"));
                 return ESP_OK;
             }
-            ESP_LOGI(TAG, "Enqueued pump action: %s", job.action);
+            ESP_LOGI(TAG, "Enqueued action=%s duration=%" PRId32 "ms", job.action, duration_to_report);
         }
     }
 
+    /* Send duration back so the HTML button syncs its Running... timer */
+    char resp_json[64];
+    snprintf(resp_json, sizeof(resp_json), "{\"ok\":true,\"duration\":%" PRId32 "}", duration_to_report);
     add_cors_headers(req);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, "{\"ok\":true}", 10);
+    httpd_resp_send(req, resp_json, strlen(resp_json));
     return ESP_OK;
 }
 
@@ -2092,62 +2129,6 @@ static esp_err_t handler_options(httpd_req_t *req)
     return ESP_OK;
 }
 
-/*
- * GET /motor?cmd=forward|backward|stop
- * GET /motor?speed=0-255
- *
- * Direct motor control endpoint — bypasses the pump queue so the
- * motor responds immediately to button presses from the HTML page.
- * The speed parameter sets the PWM duty cycle on the ENA pin (GPIO 14).
- */
-static esp_err_t handler_motor(httpd_req_t *req)
-{
-    char query[64] = {0};
-    char value[16] = {0};
-
-    add_cors_headers(req);
-    httpd_resp_set_type(req, "application/json");
-
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
-        httpd_resp_send(req, "{\"ok\":false,\"error\":\"no_params\"}", -1);
-        return ESP_OK;
-    }
-
-    /* Handle ?cmd=forward|backward|stop */
-    if (httpd_query_key_value(query, "cmd", value, sizeof(value)) == ESP_OK) {
-        if (strcmp(value, "forward") == 0) {
-            motor_forward(MOTOR_PWM_DEFAULT);
-        } else if (strcmp(value, "backward") == 0) {
-            motor_backward(MOTOR_PWM_DEFAULT);
-        } else if (strcmp(value, "stop") == 0) {
-            motor_stop();
-        } else {
-            ESP_LOGW(TAG, "Unknown motor cmd: %s", value);
-            httpd_resp_send(req, "{\"ok\":false,\"error\":\"unknown_cmd\"}", -1);
-            return ESP_OK;
-        }
-        ESP_LOGI(TAG, "/motor cmd=%s", value);
-        char resp[48];
-        snprintf(resp, sizeof(resp), "{\"ok\":true,\"cmd\":\"%s\"}", value);
-        httpd_resp_send(req, resp, strlen(resp));
-        return ESP_OK;
-    }
-
-    /* Handle ?speed=0-255 */
-    if (httpd_query_key_value(query, "speed", value, sizeof(value)) == ESP_OK) {
-        uint32_t duty = (uint32_t)atoi(value);
-        motor_set_speed(duty);
-        ESP_LOGI(TAG, "/motor speed=%"PRIu32, duty);
-        char resp[48];
-        snprintf(resp, sizeof(resp), "{\"ok\":true,\"speed\":%"PRIu32"}", duty);
-        httpd_resp_send(req, resp, strlen(resp));
-        return ESP_OK;
-    }
-
-    httpd_resp_send(req, "{\"ok\":false,\"error\":\"unknown_param\"}", -1);
-    return ESP_OK;
-}
-
 /* ----------------------------------------------------------------
    HTTP SERVER STARTUP
    ---------------------------------------------------------------- */
@@ -2155,7 +2136,7 @@ static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
     config.server_port     = 80;
-    config.max_uri_handlers = 9;
+    config.max_uri_handlers = 8;
     config.stack_size      = 16384;
 
     httpd_handle_t server = NULL;
@@ -2164,16 +2145,14 @@ static httpd_handle_t start_webserver(void)
         return NULL;
     }
 
-    httpd_uri_t uri_root  = { .uri = "/",        .method = HTTP_GET,     .handler = handler_root    };
-    httpd_uri_t uri_data  = { .uri = "/data",     .method = HTTP_GET,     .handler = handler_data    };
-    httpd_uri_t uri_act   = { .uri = "/action",   .method = HTTP_GET,     .handler = handler_action  };
-    httpd_uri_t uri_motor = { .uri = "/motor",    .method = HTTP_GET,     .handler = handler_motor   };
-    httpd_uri_t uri_opts  = { .uri = "/analyze",  .method = HTTP_OPTIONS, .handler = handler_options };
+    httpd_uri_t uri_root = { .uri = "/",       .method = HTTP_GET,     .handler = handler_root    };
+    httpd_uri_t uri_data = { .uri = "/data",    .method = HTTP_GET,     .handler = handler_data    };
+    httpd_uri_t uri_act  = { .uri = "/action",  .method = HTTP_GET,     .handler = handler_action  };
+    httpd_uri_t uri_opts = { .uri = "/analyze", .method = HTTP_OPTIONS, .handler = handler_options };
 
     httpd_register_uri_handler(server, &uri_root);
     httpd_register_uri_handler(server, &uri_data);
     httpd_register_uri_handler(server, &uri_act);
-    httpd_register_uri_handler(server, &uri_motor);
     httpd_register_uri_handler(server, &uri_opts);
 
     ESP_LOGI(TAG, "HTTP server started on port 80");
@@ -2194,11 +2173,98 @@ static void gpio_init_pumps(void)
     };
     gpio_config(&io_conf);
 
+    /* Max drive strength — ensures GPIO 25 and 26 reach full 3.3V output */
+    gpio_set_drive_capability(PIN_PUMP_WATER,    GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(PIN_PUMP_NUTRIENT, GPIO_DRIVE_CAP_3);
+
     gpio_set_level(PIN_PUMP_WATER,    0);
     gpio_set_level(PIN_PUMP_NUTRIENT, 0);
 
-    ESP_LOGI(TAG, "Pump GPIOs configured (25, 26) — all OFF");
+    ESP_LOGI(TAG, "Pump GPIOs configured (25, 26) — all OFF, drive=MAX");
 }
+
+/* ================================================================
+   TEST — GPIO 27 OUTPUT VERIFICATION
+   ════════════════════════════════════════════════════════════════
+   Enable by setting  #define TEST_GPIO27 1  near the top.
+   Set back to 0 before deploying — this replaces app_main entirely
+   and the normal firmware will NOT run while the test is active.
+
+   What to expect (repeating forever):
+     Phase 1 — SLOW BLINK x5  : 500 ms ON / 500 ms OFF
+     Phase 2 — HOLD HIGH 3 s  : LED stays solid ON
+     Phase 3 — HOLD LOW  2 s  : LED stays OFF
+     Phase 4 — FAST BLINK x10 : 100 ms ON / 100 ms OFF
+
+   If the LED does not light during Phase 2 (HOLD HIGH):
+     - Flip the LED — long leg to resistor, short leg to GND
+     - Confirm the 330Ohm is between GPIO 27 and the LED (+)
+     - Check you actually flashed with TEST_GPIO27 1
+   ================================================================ */
+#if TEST_GPIO27
+
+static void _test_pin_set(int level)
+{
+    gpio_set_level(MOTOR_PIN_IN1, level);
+    ESP_LOGI(TAG, "[TEST] GPIO %d -> %s  (%s)",
+             MOTOR_PIN_IN1,
+             level ? "HIGH (3.3V)" : "LOW  (0V)",
+             level ? "LED ON" : "LED OFF");
+}
+
+static void _test_blink(int count, int on_ms, int off_ms)
+{
+    ESP_LOGI(TAG, "[TEST] BLINK x%d  (%d ms ON / %d ms OFF)", count, on_ms, off_ms);
+    for (int i = 0; i < count; i++) {
+        _test_pin_set(1);
+        vTaskDelay(pdMS_TO_TICKS(on_ms));
+        _test_pin_set(0);
+        vTaskDelay(pdMS_TO_TICKS(off_ms));
+    }
+}
+
+static void _test_hold(int level, int duration_ms)
+{
+    ESP_LOGI(TAG, "[TEST] HOLD %s for %d ms", level ? "HIGH" : "LOW", duration_ms);
+    _test_pin_set(level);
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, " GPIO 27 OUTPUT TEST                    ");
+    ESP_LOGI(TAG, " Normal firmware is disabled.           ");
+    ESP_LOGI(TAG, " Circuit: GPIO27 -> 330Ohm -> LED -> GND");
+    ESP_LOGI(TAG, "========================================");
+
+    /* Configure GPIO 27 (MOTOR_PIN_IN1) as output, start LOW */
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << MOTOR_PIN_IN1),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    gpio_set_level(MOTOR_PIN_IN1, 0);
+    ESP_LOGI(TAG, "[TEST] GPIO %d configured as output, starting LOW", MOTOR_PIN_IN1);
+
+    for (;;) {
+        ESP_LOGI(TAG, "[TEST] === Cycle start ===");
+        _test_blink(5, 500, 500);   /* Phase 1: slow blink  — confirms toggle    */
+        _test_hold(1, 3000);        /* Phase 2: hold HIGH   — confirms sustained */
+        _test_hold(0, 2000);        /* Phase 3: hold LOW    — confirms clean GND */
+        _test_blink(10, 100, 100);  /* Phase 4: fast blink  — confirms switching */
+        ESP_LOGI(TAG, "[TEST] === Cycle done, restarting in 1 s ===");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/* ================================================================
+   END TEST BLOCK — set TEST_GPIO27 0 to restore normal firmware
+   ================================================================ */
+#else  /* normal Plantagochi firmware */
 
 /* ----------------------------------------------------------------
    APP MAIN
@@ -2248,3 +2314,5 @@ void app_main(void)
     ESP_LOGI(TAG, "For Flask image analysis: connect laptop to same AP,");
     ESP_LOGI(TAG, "update LAPTOP_IP to its 192.168.4.x address, rebuild.");
 }
+
+#endif /* TEST_GPIO27 */
