@@ -1,100 +1,38 @@
 /*
- * ================================================================
- *  Plantagochi — ESP32-WROOM-32 Firmware (ESP-IDF)
- *  Framework: ESP-IDF 5.x (idf.py)
- *  Language:  C
- * ================================================================
+ * Plantagochi — ESP32-WROOM-32 Firmware (ESP-IDF 5.x)
  *
- *  WHAT THIS DOES:
- *  ─────────────────
- *  1. Starts a Wi-Fi Access Point (hotspot) — other devices connect TO it
- *  2. Starts an HTTP server on port 80
- *  3. GET /       → serves plantagochi.html to the browser
- *  4. GET /data   → returns sensor readings as JSON
- *  5. GET /action → triggers water / nutrient / pH pump
- *  6. CORS headers on every response so the browser page
- *     (served from ESP32) can also call the laptop's
- *     Flask server (server.py) for CNN image analysis
+ * Starts a Wi-Fi Access Point, serves a browser dashboard on port 80,
+ * reads water level / TDS / pH sensors, and controls pump relays and
+ * a DC motor (pH adjustment) via HTTP endpoints.
  *
- *  SENSOR ALGORITHMS (integrated from combined-code-plantagochi.c):
- *  ─────────────────────────────────────────────────────────────────
- *  • Water Level  — 10-sample ADC average → maps 0–4095 to 0–100%
- *  • TDS/Nutrient — 32-sample ADS1115 average (I2C) → cubic
- *                   polynomial → temperature-compensated EC → ppm
- *                   Clamped to 0–2000 ppm.
- *  • pH           — 10 ADC samples → bubble-sort → middle-6 average
- *                   → linear voltage-to-pH conversion
- *                   Calibration value: -5.70 * V + 22.84
+ * Endpoints:
+ *   GET /          → serves the HTML dashboard
+ *   GET /data      → returns { "water": %, "food": ppm, "ph": value }
+ *   GET /action    → triggers water / nutrient / pH pump
  *
- *  HOW TO FLASH:
- *  ──────────────
- *  Step 1 — Set WIFI_SSID and WIFI_PASSWORD to whatever you want the
- *           ESP32 hotspot to be called (e.g. "PLANTAGOCHI" / "12345678")
- *           Set LAPTOP_IP to the IP your laptop gets after connecting
- *           to that hotspot (usually 192.168.4.2)
- *  Step 2 — Paste plantagochi.html into HTML_PAGE below
- *           (read the instructions at that section)
- *  Step 3 — Set SIMULATE_SENSORS to 0 when sensors are wired
- *  Step 4 — In terminal, from this project folder:
+ * Flash steps:
+ *   1. Set WIFI_SSID, WIFI_PASSWORD, and LAPTOP_IP below.
+ *   2. Paste plantagochi.html into HTML_PAGE (see instructions there).
+ *   3. Set SIMULATE_SENSORS 0 when sensors are wired.
+ *   4. idf.py set-target esp32 && idf.py build
+ *      idf.py -p /dev/ttyUSB0 flash monitor
+ *   5. Connect to Wi-Fi PLANTAGOCHI, open http://192.168.4.1
+ *   6. On your laptop: source venv/bin/activate && python server.py
  *
- *           idf.py set-target esp32
- *           idf.py build
- *           idf.py -p /dev/ttyUSB0 flash monitor
+ * Pin assignments (ESP32-WROOM-32):
+ *   GPIO 34 — Water level sensor  (ADC1_CH6)
+ *   GPIO 32 — pH sensor           (ADC1_CH4)
+ *   GPIO 21 — I2C SDA → ADS1115 (TDS)
+ *   GPIO 22 — I2C SCL → ADS1115 (TDS)
+ *   GPIO 25 — Water pump relay
+ *   GPIO 26 — Nutrient pump relay
+ *   GPIO 27 — DC motor IN1 (pH adjustment, L298N)
+ *   GPIO 33 — DC motor IN2
+ *   GPIO 14 — DC motor ENA (PWM)
  *
- *           Replace /dev/ttyUSB0 with your actual port.
- *           On Linux:   /dev/ttyUSB0 or /dev/ttyACM0
- *           On Mac:     /dev/cu.usbserial-XXXX
- *           On Windows: COM3, COM4, etc.
- *
- *  Step 5 — Serial monitor opens automatically after flash.
- *           The ESP32 IP is always 192.168.4.1 in AP mode.
- *           On your phone/laptop, connect to Wi-Fi: PLANTAGOCHI
- *           Then open http://192.168.4.1 in any browser.
- *
- *  Step 6 — On your laptop, start the Flask server:
- *           source venv/bin/activate
- *           python server.py
- *
- * ================================================================
- *  PIN ASSIGNMENTS (ESP32-WROOM-32, 38-pin)
- * ================================================================
- *
- *  SENSOR INPUTS (ADC1 only — safe with Wi-Fi):
- *  GPIO 34 → Water level sensor  (ADC1_CH6, input-only)
- *  GPIO 32 → pH sensor           (ADC1_CH4)
- *
- *  TDS SENSOR — ADS1115 via I2C:
- *  GPIO 21 → I2C SDA (connect to ADS1115 SDA)
- *  GPIO 22 → I2C SCL (connect to ADS1115 SCL)
- *  ADS1115 ADDR pin → GND  (I2C address 0x48)
- *  ADS1115 A0       → TDS probe signal wire
- *
- *  PUMP RELAY OUTPUTS:
- *  GPIO 25 → Water pump relay
- *  GPIO 26 → Nutrient pump relay
- *  GPIO 27 → pH-up/down pump relay
- *
- *  NEVER USE:
- *  GPIO 0  — boot mode strapping
- *  GPIO 12 — flash voltage strapping
- *  ADC2 pins (0,2,4,12-15,25-27) conflict with Wi-Fi
- *  SD0/SD1/SD2/SD3/CMD/CLK — internal flash
- *
- * ================================================================
- *  CMakeLists.txt (main/CMakeLists.txt) must list i2c driver:
- *
- *  idf_component_register(
- *      SRCS "main.c"
- *      INCLUDE_DIRS "."
- *      REQUIRES esp_wifi nvs_flash esp_http_server
- *                esp_adc driver   <-- 'driver' covers i2c + gpio
- *  )
- * ================================================================
+ * Avoid: GPIO 0 (boot), GPIO 12 (flash voltage), ADC2 pins (Wi-Fi conflict)
  */
 
-/* ----------------------------------------------------------------
-   Standard & FreeRTOS includes
-   ---------------------------------------------------------------- */
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -103,127 +41,82 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-/* ----------------------------------------------------------------
-   ESP-IDF system & peripheral includes
-   ---------------------------------------------------------------- */
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_adc/adc_oneshot.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"         /* PWM for DC motor enable pin  */
-#include "driver/i2c.h"          /* ADS1115 TDS sensor via I2C   */
+#include "driver/ledc.h"
+#include "driver/i2c.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
 
-/* ================================================================
-   STEP 1 — FILL IN THESE VALUES BEFORE BUILDING
-   ================================================================ */
+/* ----------------------------------------------------------------
+   STEP 1 — Configure these before building
+   ---------------------------------------------------------------- */
+#define WIFI_SSID       "PLANTAGOCHI"
+#define WIFI_PASSWORD   "12345678"
+#define LAPTOP_IP       "YOUR_LAPTOP_IP"   /* laptop IP on the AP network */
 
-#define WIFI_SSID      "PLANTAGOCHI"       /* your Wi-Fi SSID     */
-#define WIFI_PASSWORD  "12345678"   /* your Wi-Fi password */
+#define WIFI_AP_CHANNEL     1
+#define WIFI_AP_MAX_CONN    4
 
-/*
- * Your laptop's local IP address while running server.py.
- * Find it: run  hostname -I  (Linux/Mac)  or  ipconfig  (Windows)
- * Example: "192.168.1.105"
- */
-#define LAPTOP_IP      "YOUR_LAPTOP_IP"
-
-/* Access-Point configuration */
-#define WIFI_AP_CHANNEL     1           /* 1–13; pick one not congested nearby */
-#define WIFI_AP_MAX_CONN    4           /* max simultaneous connected devices   */
-
-/* ================================================================
-   SIMULATE_SENSORS
-   1 = fake readings (use while sensors not physically wired)
-   0 = real sensor readings (set when sensors are connected)
-   ================================================================ */
+/* 1 = fake sensor data for testing, 0 = real sensors */
 #define SIMULATE_SENSORS 1
 
-/* ================================================================
-   PIN DEFINITIONS — SENSOR INPUTS (ADC1 only)
-   ================================================================ */
-#define PIN_WATER  ADC_CHANNEL_6   /* GPIO 34 — water level  */
-#define PIN_PH     ADC_CHANNEL_4   /* GPIO 32 — pH           */
-/* TDS uses ADS1115 via I2C — see ADS1115 section below       */
+/* ----------------------------------------------------------------
+   PIN DEFINITIONS
+   ---------------------------------------------------------------- */
+#define PIN_WATER   ADC_CHANNEL_6   /* GPIO 34 */
+#define PIN_PH      ADC_CHANNEL_4   /* GPIO 32 */
 
-/* ================================================================
-   PIN DEFINITIONS — PUMP RELAY OUTPUTS
-   ================================================================ */
-#define PIN_PUMP_WATER    GPIO_NUM_25
-#define PIN_PUMP_NUTRIENT GPIO_NUM_26
-/* GPIO 27 is now the DC motor IN1 pin — see MOTOR section below */
+#define PIN_PUMP_WATER      GPIO_NUM_25
+#define PIN_PUMP_NUTRIENT   GPIO_NUM_26
 
-/* ================================================================
-   DC MOTOR (L298N) — GPIO 27  [MOTOR_PIN_27]
-   ─────────────────────────────────────────────────────────────────
-   Wiring (L298N module):
-     IN1  → GPIO 27  (direction pin 1, formerly pH relay)
-     IN2  → GPIO 33  (direction pin 2, free GPIO chosen to keep GPIO 26 free)
-     ENA  → GPIO 14  (PWM enable — controls speed via LEDC)
-     OUT1 / OUT2 → motor terminals
+/* DC motor (L298N) for pH adjustment */
+#define MOTOR_PIN_IN1       GPIO_NUM_27
+#define MOTOR_PIN_IN2       GPIO_NUM_33
+#define MOTOR_PIN_EN        GPIO_NUM_14
 
-   Direction logic:
-     Forward  : IN1=LOW,  IN2=HIGH
-     Backward : IN1=HIGH, IN2=LOW
-     Stop     : IN1=LOW,  IN2=LOW   (or coast; brake = both HIGH)
+#define MOTOR_PWM_FREQ      30000
+#define MOTOR_PWM_RES       LEDC_TIMER_8_BIT
+#define MOTOR_PWM_TIMER     LEDC_TIMER_0
+#define MOTOR_PWM_CHANNEL   LEDC_CHANNEL_0
+#define MOTOR_PWM_DEFAULT   200   /* ~78% duty cycle */
 
-   PWM (LEDC):
-     Timer    : LEDC_TIMER_0,   30 kHz,  8-bit resolution (0-255)
-     Channel  : LEDC_CHANNEL_0, GPIO 14
-     Default duty: 200 / 255 ≈ 78 % speed
-   ================================================================ */
-#define MOTOR_PIN_IN1      GPIO_NUM_27   /* L298N IN1 — direction 1 */
-#define MOTOR_PIN_IN2      GPIO_NUM_33   /* L298N IN2 — direction 2 */
-#define MOTOR_PIN_EN       GPIO_NUM_14   /* L298N ENA — PWM enable  */
-
-#define MOTOR_PWM_FREQ     30000         /* 30 kHz carrier           */
-#define MOTOR_PWM_RES      LEDC_TIMER_8_BIT   /* 8-bit (0-255)      */
-#define MOTOR_PWM_TIMER    LEDC_TIMER_0
-#define MOTOR_PWM_CHANNEL  LEDC_CHANNEL_0
-#define MOTOR_PWM_DEFAULT  200           /* default duty (≈78%)      */
-
-/* ================================================================
-   I2C / ADS1115 CONFIGURATION (TDS sensor)
-   ================================================================ */
-#define I2C_MASTER_SDA_IO   21          /* ESP32 default SDA pin     */
-#define I2C_MASTER_SCL_IO   22          /* ESP32 default SCL pin     */
-#define I2C_MASTER_FREQ_HZ  100000      /* 100 kHz standard mode     */
+/* ----------------------------------------------------------------
+   I2C / ADS1115 (TDS sensor)
+   ---------------------------------------------------------------- */
+#define I2C_MASTER_SDA_IO   21
+#define I2C_MASTER_SCL_IO   22
+#define I2C_MASTER_FREQ_HZ  100000
 #define I2C_MASTER_PORT     I2C_NUM_0
 #define I2C_TIMEOUT_MS      100
 
-#define ADS1115_ADDR          0x48      /* ADDR pin tied to GND      */
-#define ADS1115_REG_CONVERT   0x00      /* Conversion result register */
-#define ADS1115_REG_CONFIG    0x01      /* Configuration register     */
+#define ADS1115_ADDR        0x48
+#define ADS1115_REG_CONVERT 0x00
+#define ADS1115_REG_CONFIG  0x01
 
 /*
- * ADS1115 config word for:
- *   OS=1   (start single-shot conversion)
- *   MUX=100 (AIN0 vs GND, single-ended)
- *   PGA=001 (±4.096 V, 1 bit = 125 µV)
- *   MODE=1  (single-shot)
- *   DR=100  (128 SPS)
- *   COMP_QUE=11 (disable comparator)
- * High byte: 0xC2 | 0x01 = 0xC3  (OS + MUX=AIN0 + PGA=±4.096V + single)
- * Low byte:  0x80 | 0x03 = 0x83  (DR=128SPS + comp disabled)
+ * ADS1115 config: single-shot on AIN0, PGA=±4.096V, 128 SPS, comparator off.
+ * High byte: OS=1, MUX=AIN0, PGA=±4.096V, single-shot
+ * Low byte:  DR=128SPS, comparator disabled
  */
 #define ADS_CFG_HI  0xC3
 #define ADS_CFG_LO  0x83
 
-/* LSB voltage for PGA = ±4.096 V (as in GAIN_ONE / computeVolts) */
-#define ADS1115_LSB_VOLTS  0.000125f
+#define ADS1115_LSB_VOLTS   0.000125f   /* 125 µV per LSB at PGA ±4.096V */
 
-/* ================================================================
-   TDS ALGORITHM PARAMETERS (from combined-code-plantagochi.c)
-   ================================================================ */
-#define TDS_NUM_SAMPLES    32           /* ADC samples to average     */
-#define TDS_WATER_TEMP_C   25.0f        /* Water temperature (°C)     */
-#define TDS_K_CELL         1.00f        /* Cell constant — tweak on calibration */
-#define TDS_FACTOR         0.3f         /* EC → TDS conversion factor */
-#define TDS_MAX_PPM        2000.0f      /* Clamp ceiling (ppm)        */
+/* ----------------------------------------------------------------
+   TDS ALGORITHM PARAMETERS
+   ---------------------------------------------------------------- */
+#define TDS_NUM_SAMPLES     32
+#define TDS_WATER_TEMP_C    25.0f
+#define TDS_K_CELL          1.00f   /* cell constant — adjust on calibration */
+#define TDS_FACTOR          0.3f    /* EC → TDS conversion factor */
+#define TDS_MAX_PPM         2000.0f
 
 /* ================================================================
    HTML PAGE
@@ -1694,13 +1587,10 @@ static const char HTML_PAGE[] =
 "</body>\n"
 "</html>\n";
 
-/* ================================================================
-   LOGGING TAG
-   ================================================================ */
 static const char *TAG = "PLANTAGOCHI";
 
-/* Pump job queue — pump requests are enqueued and handled by a worker task
-   to avoid blocking HTTP handlers and to serialize relay operations. */
+/* Pump jobs are queued and processed by a worker task so HTTP handlers
+   never block waiting for a relay to finish. */
 typedef struct {
     gpio_num_t pin;
     int32_t duration_ms;
@@ -1709,7 +1599,6 @@ typedef struct {
 
 static QueueHandle_t pump_queue = NULL;
 
-/* forward declarations so pump_worker can call motor and pump functions */
 static void trigger_pump(gpio_num_t pin, int duration_ms);
 static void motor_run_sequence(void);
 
@@ -1722,23 +1611,19 @@ static void pump_worker(void *arg)
                      job.action, job.pin, job.duration_ms);
 
             if (strcmp(job.action, "ph") == 0) {
-                /* GPIO 27 is a DC motor — run the full test sequence */
                 motor_run_sequence();
             } else {
-                /* Water (GPIO 25) and nutrient (GPIO 26) remain relay-based */
                 trigger_pump(job.pin, job.duration_ms);
             }
 
-            /* small inter-job gap to avoid rapid toggling */
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 }
 
-/* ================================================================
-   WI-FI ACCESS-POINT EVENT HANDLING
-   Logs when a device connects or disconnects from the ESP32 hotspot.
-   ================================================================ */
+/* ----------------------------------------------------------------
+   WI-FI ACCESS POINT
+   ---------------------------------------------------------------- */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
@@ -1756,14 +1641,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-/*
- * wifi_init()
- * ───────────
- * Starts the ESP32 as a Wi-Fi Access Point (hotspot).
- * After this returns, any phone/laptop can connect to the
- * SSID defined by WIFI_SSID / WIFI_PASSWORD above.
- * The ESP32 is always reachable at http://192.168.4.1
- */
+/* Starts the ESP32 as a Wi-Fi AP. Reachable at http://192.168.4.1 */
 static void wifi_init(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -1787,10 +1665,6 @@ static void wifi_init(void)
         },
     };
 
-    /*
-     * If no password is set, fall back to open (no auth).
-     * Useful for quick testing — not recommended for deployment.
-     */
     if (strlen(WIFI_PASSWORD) == 0) {
         ap_config.ap.authmode = WIFI_AUTH_OPEN;
     }
@@ -1804,11 +1678,10 @@ static void wifi_init(void)
     ESP_LOGI(TAG, "then open http://192.168.4.1 in your browser.");
 }
 
-/* ================================================================
-   ADC SETUP — ESP-IDF 5.x oneshot driver
-   Channels: water level (GPIO 34) and pH (GPIO 32).
-   TDS uses ADS1115 via I2C — NOT the internal ADC.
-   ================================================================ */
+/* ----------------------------------------------------------------
+   ADC — water level (GPIO 34) and pH (GPIO 32)
+   TDS uses ADS1115 via I2C, not the internal ADC.
+   ---------------------------------------------------------------- */
 static adc_oneshot_unit_handle_t adc_handle;
 
 static void adc_init(void)
@@ -1819,10 +1692,7 @@ static void adc_init(void)
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc_handle));
 
-    /*
-     * 12-bit width (0–4095), 11 dB attenuation → ~0–3.1 V input range.
-     * This comfortably covers the 0–3.3 V signals from both sensors.
-     */
+    /* 12-bit, 11 dB attenuation → ~0–3.1 V input range */
     adc_oneshot_chan_cfg_t chan_cfg = {
         .bitwidth = ADC_BITWIDTH_12,
         .atten    = ADC_ATTEN_DB_12,
@@ -1833,11 +1703,9 @@ static void adc_init(void)
     ESP_LOGI(TAG, "ADC1 configured — channels: water(GPIO34), pH(GPIO32)");
 }
 
-/* ================================================================
-   I2C MASTER SETUP (for ADS1115 TDS sensor)
-   SDA = GPIO 21, SCL = GPIO 22 (ESP32 hardware defaults).
-   Call once from app_main before the first TDS read.
-   ================================================================ */
+/* ----------------------------------------------------------------
+   I2C MASTER — SDA GPIO 21, SCL GPIO 22
+   ---------------------------------------------------------------- */
 static void i2c_master_init(void)
 {
     i2c_config_t conf = {
@@ -1849,26 +1717,21 @@ static void i2c_master_init(void)
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
     ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_PORT, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_PORT, conf.mode,
-                                       0, 0, 0));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_PORT, conf.mode, 0, 0, 0));
     ESP_LOGI(TAG, "I2C master ready — SDA:GPIO%d SCL:GPIO%d @ %d Hz",
              I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO, I2C_MASTER_FREQ_HZ);
 }
 
-/* ================================================================
-   ADS1115 SINGLE CHANNEL READ
-   Triggers a single-shot conversion on A0 (channel 0),
-   waits for the result, and returns the raw signed 16-bit value.
-   Conversion time at 128 SPS = ~8 ms; we wait 10 ms to be safe.
-   Returns 0 on I2C communication error.
-   ================================================================ */
+/* ----------------------------------------------------------------
+   ADS1115 — single-shot read on channel A0
+   Returns raw signed 16-bit value, or 0 on I2C error.
+   ---------------------------------------------------------------- */
 static int16_t ads1115_read_a0(void)
 {
-    /* --- Write config register to start conversion --- */
     uint8_t write_buf[3] = {
         ADS1115_REG_CONFIG,
-        ADS_CFG_HI,   /* MSB: OS=1, MUX=AIN0, PGA=±4.096V, single-shot */
-        ADS_CFG_LO,   /* LSB: DR=128SPS, comparator disabled            */
+        ADS_CFG_HI,
+        ADS_CFG_LO,
     };
     esp_err_t err = i2c_master_write_to_device(
         I2C_MASTER_PORT, ADS1115_ADDR,
@@ -1879,10 +1742,8 @@ static int16_t ads1115_read_a0(void)
         return 0;
     }
 
-    /* --- Wait for conversion to complete (~10 ms at 128 SPS) --- */
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(10)); /* wait for conversion at 128 SPS */
 
-    /* --- Point to conversion register --- */
     uint8_t reg_ptr = ADS1115_REG_CONVERT;
     err = i2c_master_write_to_device(
         I2C_MASTER_PORT, ADS1115_ADDR,
@@ -1893,7 +1754,6 @@ static int16_t ads1115_read_a0(void)
         return 0;
     }
 
-    /* --- Read 2-byte conversion result (big-endian) --- */
     uint8_t data[2] = {0};
     err = i2c_master_read_from_device(
         I2C_MASTER_PORT, ADS1115_ADDR,
@@ -1907,25 +1767,13 @@ static int16_t ads1115_read_a0(void)
     return (int16_t)((data[0] << 8) | data[1]);
 }
 
-/* ================================================================
+/* ----------------------------------------------------------------
    SENSOR READING FUNCTIONS
-   All three functions implement the improved algorithms from
-   combined-code-plantagochi.c, adapted for the ESP-IDF environment.
-   ================================================================ */
+   ---------------------------------------------------------------- */
 
-/*
- * read_water_level()
- * ─────────────────
- * Takes 10 ADC readings from the water-level sensor (GPIO 34),
- * averages them for noise reduction, and maps the result to
- * a percentage in the range 0.0–100.0.
- *
- * Simulated: ~72% with ±3% noise for realistic dashboard testing.
- *
- * Calibration: if your sensor does not use the full 0–4095 ADC range
- * (e.g. empty = 400, full = 3600), adjust the denominator and offset
- * in the percentage formula accordingly.
- */
+/* Returns water level as a percentage (0–100%).
+   Averages 10 ADC samples; maps raw 0–4095 to 0–100%.
+   Simulated: ~72% ±3%. */
 static float read_water_level(void)
 {
 #if SIMULATE_SENSORS
@@ -1936,7 +1784,7 @@ static float read_water_level(void)
         int raw = 0;
         adc_oneshot_read(adc_handle, PIN_WATER, &raw);
         acc += raw;
-        vTaskDelay(pdMS_TO_TICKS(10)); /* small delay to stabilise readings */
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     int avg = (int)(acc / 10);
     float pct = (avg / 4095.0f) * 100.0f;
@@ -1946,28 +1794,12 @@ static float read_water_level(void)
 #endif
 }
 
-/*
- * read_tds()
- * ──────────
- * Collects TDS_NUM_SAMPLES (32) readings from the ADS1115 on
- * channel A0, averages them, converts the averaged raw count to
- * a voltage, then applies:
- *
- *   EC (mS/cm) = 133.42·V³ − 255.86·V² + 857.39·V
- *   EC25       = EC / (1 + 0.02·(T − 25))   [temperature compensation]
- *   TDS (ppm)  = EC25 × K_CELL × TDS_FACTOR × 1000
- *
- * Result is clamped to 0–2000 ppm.
- *
- * Simulated: ~700 ppm (centre of lettuce ideal range 560–840 ppm)
- *            with ±50 ppm noise.
- *
- * Calibration:
- *   • Adjust TDS_K_CELL (cell constant, typically 0.9–1.1)
- *   • Adjust TDS_FACTOR if using a different sensor model
- *   • Set TDS_WATER_TEMP_C to your actual water temperature, or
- *     wire a DS18B20 and feed its reading into waterTempC at runtime.
- */
+/* Returns TDS in ppm (0–2000).
+   Averages 32 ADS1115 samples, then applies:
+     EC (mS/cm) = 133.42·V³ − 255.86·V² + 857.39·V
+     EC25 = EC / (1 + 0.02·(T − 25))   [temperature compensated]
+     TDS = EC25 × K_CELL × TDS_FACTOR × 1000
+   Simulated: ~700 ppm ±50. */
 static float read_tds(void)
 {
 #if SIMULATE_SENSORS
@@ -1977,77 +1809,45 @@ static float read_tds(void)
     for (uint16_t i = 0; i < TDS_NUM_SAMPLES; i++) {
         int16_t raw = ads1115_read_a0();
         acc += raw;
-        /* ~800 µs between samples mirrors the original combined-code delay */
-        vTaskDelay(1); /* minimum 1 FreeRTOS tick ≈ 1 ms (close enough) */
+        vTaskDelay(1);
     }
     float avg_raw = (float)acc / TDS_NUM_SAMPLES;
 
-    /* Convert raw count to voltage: LSB = 125 µV for PGA ±4.096 V */
     float v = avg_raw * ADS1115_LSB_VOLTS;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 3.3f) v = 3.3f;
 
-    /* Clamp voltage to valid range */
-    if (v < 0.0f)  v = 0.0f;
-    if (v > 3.3f)  v = 3.3f;
-
-    /* Cubic polynomial: EC in mS/cm */
     float ec = (133.42f * v * v * v)
              - (255.86f * v * v)
              + (857.39f * v);
-
-    /* Cell-constant scaling */
     ec *= TDS_K_CELL;
 
-    /* Temperature compensation to EC at 25 °C */
     float ec25 = ec / (1.0f + 0.02f * (TDS_WATER_TEMP_C - 25.0f));
+    float tds  = ec25 * TDS_FACTOR * 1000.0f;
 
-    /* EC25 → TDS in ppm */
-    float tds = ec25 * TDS_FACTOR * 1000.0f;
-
-    /* Clamp to sensible range */
-    if (tds < 0.0f)       tds = 0.0f;
+    if (tds < 0.0f)        tds = 0.0f;
     if (tds > TDS_MAX_PPM) tds = TDS_MAX_PPM;
 
     return tds;
 #endif
 }
 
-/*
- * read_ph()
- * ─────────
- * Collects 10 ADC readings from the pH sensor (GPIO 32), sorts
- * them with a bubble sort, discards the 2 lowest and 2 highest
- * outliers, averages the remaining 6 middle samples, then converts
- * the averaged voltage to a pH value using:
- *
- *   volt   = avg_adc × (3.3 / 4095)
- *   pH     = (–5.70 × volt) + 22.84
- *
- * calibration_value = 21.34 + 1.5 = 22.84  (from combined-code)
- *
- * The bubble-sort median filter significantly reduces the impact of
- * ADC spikes compared to a plain average, and the outer-sample
- * rejection improves stability near air bubbles or probe movement.
- *
- * Simulated: ~6.1 with ±0.3 noise (centre of lettuce ideal 5.5–6.5).
- *
- * Calibration:
- *   • Immerse probe in pH 7 buffer; adjust calibration_value until
- *     the reading = 7.0
- *   • Immerse in pH 4 buffer; fine-tune the –5.70 slope if needed.
- */
+/* Returns pH value (0–14).
+   Collects 10 ADC samples, bubble-sorts, averages the 6 middle values,
+   then converts: pH = (−5.70 × volt) + 22.84
+   Simulated: ~6.1 ±0.3. */
 static float read_ph(void)
 {
 #if SIMULATE_SENSORS
     return 6.1f + ((rand() % 60 - 30) / 100.0f);
 #else
-    /* --- Collect 10 samples --- */
     int buf[10];
     for (int i = 0; i < 10; i++) {
         adc_oneshot_read(adc_handle, PIN_PH, &buf[i]);
-        vTaskDelay(pdMS_TO_TICKS(30)); /* 30 ms stabilisation between reads */
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
 
-    /* --- Bubble sort (ascending) --- */
+    /* Bubble sort ascending */
     for (int i = 0; i < 9; i++) {
         for (int j = i + 1; j < 10; j++) {
             if (buf[i] > buf[j]) {
@@ -2058,16 +1858,14 @@ static float read_ph(void)
         }
     }
 
-    /* --- Average the 6 middle samples (indices 2–7), discard extremes --- */
+    /* Average middle 6 samples, discard 2 highest and 2 lowest */
     long sum = 0;
     for (int i = 2; i < 8; i++) sum += buf[i];
     float avg_adc = (float)sum / 6.0f;
 
-    /* --- Convert to voltage then to pH --- */
-    float volt  = avg_adc * (3.3f / 4095.0f);
-    float ph    = (-5.70f * volt) + 22.84f; /* calibration_value = 21.34 + 1.5 */
+    float volt = avg_adc * (3.3f / 4095.0f);
+    float ph   = (-5.70f * volt) + 22.84f;
 
-    /* Clamp to physical pH range */
     if (ph < 0.0f)  ph = 0.0f;
     if (ph > 14.0f) ph = 14.0f;
 
@@ -2075,11 +1873,11 @@ static float read_ph(void)
 #endif
 }
 
-/* ================================================================
+/* ----------------------------------------------------------------
    PUMP CONTROL
-   Sets relay pin HIGH for duration_ms milliseconds then LOW.
-   Uses FreeRTOS vTaskDelay to yield CPU to other tasks during wait.
-   ================================================================ */
+   ---------------------------------------------------------------- */
+
+/* Pulses a relay pin HIGH for duration_ms, then LOW. */
 static void trigger_pump(gpio_num_t pin, int duration_ms)
 {
     ESP_LOGI(TAG, "Pump ON → GPIO %d for %d ms", pin, duration_ms);
@@ -2089,16 +1887,10 @@ static void trigger_pump(gpio_num_t pin, int duration_ms)
     ESP_LOGI(TAG, "Pump OFF → GPIO %d", pin);
 }
 
-/* ================================================================
-   DC MOTOR CONTROL — GPIO 27 (MOTOR_PIN_27)
-   All functions assume motor_init() has already been called.
-   ================================================================ */
+/* ----------------------------------------------------------------
+   DC MOTOR CONTROL (L298N on GPIO 27/33/14)
+   ---------------------------------------------------------------- */
 
-/*
- * motor_set_speed()
- * Sets the PWM duty cycle on the ENA pin (GPIO 14).
- * duty: 0 (stopped) → 255 (full speed), 8-bit resolution.
- */
 static void motor_set_speed(uint32_t duty)
 {
     if (duty > 255) duty = 255;
@@ -2107,10 +1899,7 @@ static void motor_set_speed(uint32_t duty)
     ESP_LOGI(TAG, "Motor speed duty=%"PRIu32, duty);
 }
 
-/*
- * motor_forward()
- * IN1=LOW, IN2=HIGH → motor spins forward at given duty.
- */
+/* IN1=LOW, IN2=HIGH → forward */
 static void motor_forward(uint32_t duty)
 {
     gpio_set_level(MOTOR_PIN_IN1, 0);
@@ -2119,10 +1908,7 @@ static void motor_forward(uint32_t duty)
     ESP_LOGI(TAG, "Motor FORWARD duty=%"PRIu32, duty);
 }
 
-/*
- * motor_backward()
- * IN1=HIGH, IN2=LOW → motor spins backward at given duty.
- */
+/* IN1=HIGH, IN2=LOW → backward */
 static void motor_backward(uint32_t duty)
 {
     gpio_set_level(MOTOR_PIN_IN1, 1);
@@ -2131,10 +1917,7 @@ static void motor_backward(uint32_t duty)
     ESP_LOGI(TAG, "Motor BACKWARD duty=%"PRIu32, duty);
 }
 
-/*
- * motor_stop()
- * IN1=LOW, IN2=LOW → motor coasts to a stop (low-side brake).
- */
+/* IN1=LOW, IN2=LOW → coast stop */
 static void motor_stop(void)
 {
     gpio_set_level(MOTOR_PIN_IN1, 0);
@@ -2143,37 +1926,24 @@ static void motor_stop(void)
     ESP_LOGI(TAG, "Motor STOPPED");
 }
 
-/*
- * motor_run_sequence()
- * Mirrors the Arduino loop() in the reference sketch:
- *   1. Forward at max speed for 2 s
- *   2. Stop 1 s
- *   3. Backward at max speed for 2 s
- *   4. Stop 1 s
- *   5. Forward with duty ramping 200→255 in steps of 5 (every 500 ms)
- * Called by the pump_worker task when action="ph" is received.
- */
+/* pH action sequence: forward 2s → stop 1s → backward 2s → stop 1s → ramp up */
 static void motor_run_sequence(void)
 {
     ESP_LOGI(TAG, "Motor sequence START");
 
-    /* Step 1 — forward 2 s */
     motor_forward(255);
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    /* Step 2 — stop 1 s */
     motor_stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    /* Step 3 — backward 2 s */
     motor_backward(255);
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    /* Step 4 — stop 1 s */
     motor_stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    /* Step 5 — forward with increasing speed (200 → 255, step 5, 500 ms each) */
+    /* Ramp from MOTOR_PWM_DEFAULT (200) to 255 in steps of 5, 500 ms each */
     gpio_set_level(MOTOR_PIN_IN1, 0);
     gpio_set_level(MOTOR_PIN_IN2, 1);
     for (uint32_t duty = MOTOR_PWM_DEFAULT; duty <= 255; duty += 5) {
@@ -2186,16 +1956,9 @@ static void motor_run_sequence(void)
     ESP_LOGI(TAG, "Motor sequence END");
 }
 
-/*
- * motor_init()
- * Configures:
- *   - GPIO 27 (IN1) and GPIO 33 (IN2) as outputs, initially LOW.
- *   - LEDC timer + channel for GPIO 14 (ENA / PWM enable).
- * Call once from app_main() before starting the HTTP server.
- */
+/* Configures GPIO 27 (IN1), GPIO 33 (IN2), and LEDC PWM on GPIO 14 (ENA). */
 static void motor_init(void)
 {
-    /* --- Direction pins (IN1, IN2) as plain GPIO outputs --- */
     gpio_config_t dir_conf = {
         .pin_bit_mask = (1ULL << MOTOR_PIN_IN1) | (1ULL << MOTOR_PIN_IN2),
         .mode         = GPIO_MODE_OUTPUT,
@@ -2207,7 +1970,6 @@ static void motor_init(void)
     gpio_set_level(MOTOR_PIN_IN1, 0);
     gpio_set_level(MOTOR_PIN_IN2, 0);
 
-    /* --- LEDC timer --- */
     ledc_timer_config_t timer_conf = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .duty_resolution = MOTOR_PWM_RES,
@@ -2217,13 +1979,12 @@ static void motor_init(void)
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
 
-    /* --- LEDC channel bound to GPIO 14 (ENA) --- */
     ledc_channel_config_t ch_conf = {
         .gpio_num   = MOTOR_PIN_EN,
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel    = MOTOR_PWM_CHANNEL,
         .timer_sel  = MOTOR_PWM_TIMER,
-        .duty       = 0,        /* start with motor off */
+        .duty       = 0,
         .hpoint     = 0,
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ch_conf));
@@ -2232,12 +1993,12 @@ static void motor_init(void)
              MOTOR_PIN_IN1, MOTOR_PIN_IN2, MOTOR_PIN_EN, MOTOR_PWM_FREQ);
 }
 
-/* ================================================================
-   CORS HELPER
-   Adds Access-Control-Allow-* headers to every HTTP response.
-   Required because the browser opens the page from http://ESP32_IP
-   but POSTs images to http://LAPTOP_IP:5000 (different origin).
-   ================================================================ */
+/* ----------------------------------------------------------------
+   HTTP HELPERS
+   ---------------------------------------------------------------- */
+
+/* Adds CORS headers so the browser can POST to the Flask server
+   (different origin) while the page is served from the ESP32. */
 static esp_err_t add_cors_headers(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin",  "*");
@@ -2246,14 +2007,11 @@ static esp_err_t add_cors_headers(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* ================================================================
+/* ----------------------------------------------------------------
    HTTP ROUTE HANDLERS
-   ================================================================ */
+   ---------------------------------------------------------------- */
 
-/*
- * GET /
- * Serves the full plantagochi.html dashboard.
- */
+/* GET / — serves the HTML dashboard */
 static esp_err_t handler_root(httpd_req_t *req)
 {
     add_cors_headers(req);
@@ -2262,13 +2020,7 @@ static esp_err_t handler_root(httpd_req_t *req)
     return ESP_OK;
 }
 
-/*
- * GET /data
- * Returns current sensor readings as JSON.
- * The HTML dashboard polls this every 30 seconds.
- * Response: { "water": 72.5, "food": 700.0, "ph": 6.1 }
- * Note: "food" is the key the HTML expects for TDS/nutrients.
- */
+/* GET /data — returns sensor readings as JSON */
 static esp_err_t handler_data(httpd_req_t *req)
 {
     float water = read_water_level();
@@ -2289,10 +2041,7 @@ static esp_err_t handler_data(httpd_req_t *req)
     return ESP_OK;
 }
 
-/*
- * GET /action?action=water|food|ph
- * Triggers the corresponding pump relay.
- */
+/* GET /action?action=water|food|ph — enqueues a pump or motor job */
 static esp_err_t handler_action(httpd_req_t *req)
 {
     char param[32]  = {0};
@@ -2300,16 +2049,13 @@ static esp_err_t handler_action(httpd_req_t *req)
 
     if (httpd_req_get_url_query_str(req, param, sizeof(param)) == ESP_OK) {
         if (httpd_query_key_value(param, "action", action, sizeof(action)) == ESP_OK) {
-            /* Enqueue pump job instead of blocking in the HTTP handler. */
             pump_job_t job;
             if (strcmp(action, "water") == 0) {
                 job.pin = PIN_PUMP_WATER; job.duration_ms = 3000; snprintf(job.action, sizeof(job.action), "%s", "water");
             } else if (strcmp(action, "food") == 0) {
                 job.pin = PIN_PUMP_NUTRIENT; job.duration_ms = 2000; snprintf(job.action, sizeof(job.action), "%s", "food");
             } else if (strcmp(action, "ph") == 0) {
-                /* GPIO 27 is now a DC motor (L298N).
-                   pin=0 is the sentinel that tells pump_worker to call
-                   motor_run_sequence() instead of trigger_pump(). */
+                /* pin=0 is the sentinel that tells pump_worker to call motor_run_sequence() */
                 job.pin = 0; job.duration_ms = 0; snprintf(job.action, sizeof(job.action), "%s", "ph");
             } else {
                 ESP_LOGW(TAG, "Unknown action: %s", action);
@@ -2319,7 +2065,6 @@ static esp_err_t handler_action(httpd_req_t *req)
                 return ESP_OK;
             }
 
-            /* Try to enqueue without blocking the HTTP handler. */
             if (pump_queue == NULL || xQueueSend(pump_queue, &job, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "Pump queue full or not available — action=%s", job.action);
                 add_cors_headers(req);
@@ -2337,12 +2082,7 @@ static esp_err_t handler_action(httpd_req_t *req)
     return ESP_OK;
 }
 
-/*
- * OPTIONS /analyze
- * Handles CORS preflight from browser before image POST to Flask server.
- * The actual image POST goes directly to the laptop; ESP32 never
- * receives or processes the photo itself.
- */
+/* OPTIONS /analyze — handles CORS preflight for image POST to Flask */
 static esp_err_t handler_options(httpd_req_t *req)
 {
     add_cors_headers(req);
@@ -2351,15 +2091,15 @@ static esp_err_t handler_options(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* ================================================================
+/* ----------------------------------------------------------------
    HTTP SERVER STARTUP
-   ================================================================ */
+   ---------------------------------------------------------------- */
 static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
     config.server_port     = 80;
     config.max_uri_handlers = 8;
-    config.stack_size      = 16384; /* large stack — we send big HTML */
+    config.stack_size      = 16384;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -2367,48 +2107,27 @@ static httpd_handle_t start_webserver(void)
         return NULL;
     }
 
-    httpd_uri_t uri_root = {
-        .uri     = "/",
-        .method  = HTTP_GET,
-        .handler = handler_root,
-    };
+    httpd_uri_t uri_root = { .uri = "/",        .method = HTTP_GET,     .handler = handler_root    };
+    httpd_uri_t uri_data = { .uri = "/data",     .method = HTTP_GET,     .handler = handler_data    };
+    httpd_uri_t uri_act  = { .uri = "/action",   .method = HTTP_GET,     .handler = handler_action  };
+    httpd_uri_t uri_opts = { .uri = "/analyze",  .method = HTTP_OPTIONS, .handler = handler_options };
+
     httpd_register_uri_handler(server, &uri_root);
-
-    httpd_uri_t uri_data = {
-        .uri     = "/data",
-        .method  = HTTP_GET,
-        .handler = handler_data,
-    };
     httpd_register_uri_handler(server, &uri_data);
-
-    httpd_uri_t uri_action = {
-        .uri     = "/action",
-        .method  = HTTP_GET,
-        .handler = handler_action,
-    };
-    httpd_register_uri_handler(server, &uri_action);
-
-    httpd_uri_t uri_options = {
-        .uri     = "/analyze",
-        .method  = HTTP_OPTIONS,
-        .handler = handler_options,
-    };
-    httpd_register_uri_handler(server, &uri_options);
+    httpd_register_uri_handler(server, &uri_act);
+    httpd_register_uri_handler(server, &uri_opts);
 
     ESP_LOGI(TAG, "HTTP server started on port 80");
     return server;
 }
 
-/* ================================================================
-   GPIO SETUP FOR PUMP RELAYS
-   Sets LOW before direction change to prevent relay glitch.
-   ================================================================ */
+/* ----------------------------------------------------------------
+   GPIO SETUP — PUMP RELAYS
+   ---------------------------------------------------------------- */
 static void gpio_init_pumps(void)
 {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << PIN_PUMP_WATER)
-                      | (1ULL << PIN_PUMP_NUTRIENT),
-        /* GPIO 27 (motor IN1) is initialised in motor_init() */
+        .pin_bit_mask = (1ULL << PIN_PUMP_WATER) | (1ULL << PIN_PUMP_NUTRIENT),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -2422,12 +2141,9 @@ static void gpio_init_pumps(void)
     ESP_LOGI(TAG, "Pump GPIOs configured (25, 26) — all OFF");
 }
 
-/* ================================================================
+/* ----------------------------------------------------------------
    APP MAIN
-   Entry point for ESP-IDF.  Initialises everything in order,
-   then returns — FreeRTOS keeps the Wi-Fi stack and HTTP server
-   running as background tasks.
-   ================================================================ */
+   ---------------------------------------------------------------- */
 void app_main(void)
 {
     ESP_LOGI(TAG, "===================================");
@@ -2437,7 +2153,7 @@ void app_main(void)
              SIMULATE_SENSORS ? "ON (fake data)" : "OFF (real sensors)");
     ESP_LOGI(TAG, "===================================");
 
-    /* 1. Non-Volatile Storage — required by Wi-Fi driver */
+    /* NVS — required by Wi-Fi driver */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -2446,13 +2162,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* 2. Pump relay GPIO pins */
     gpio_init_pumps();
-
-    /* 2a. DC motor init — GPIO 27 (IN1), GPIO 33 (IN2), GPIO 14 (EN/PWM) */
     motor_init();
 
-    /* 2b. Create pump queue + worker (serializes relay ops off the HTTP handlers) */
     pump_queue = xQueueCreate(8, sizeof(pump_job_t));
     if (pump_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create pump queue");
@@ -2465,32 +2177,15 @@ void app_main(void)
         }
     }
 
-    /* 3. ADC oneshot driver — water level + pH channels */
     adc_init();
-
-    /* 4. I2C master driver — ADS1115 for TDS sensor */
     i2c_master_init();
 
-    /* 5. Start Wi-Fi Access Point — devices connect TO the ESP32 */
     ESP_LOGI(TAG, "Starting Wi-Fi AP: %s", WIFI_SSID);
     wifi_init();
-
-    /* 6. HTTP server — serves dashboard + JSON endpoints */
     start_webserver();
 
     ESP_LOGI(TAG, "System ready.");
     ESP_LOGI(TAG, "Connect to Wi-Fi \"%s\", then open http://192.168.4.1", WIFI_SSID);
     ESP_LOGI(TAG, "For Flask image analysis: connect laptop to same AP,");
     ESP_LOGI(TAG, "update LAPTOP_IP to its 192.168.4.x address, rebuild.");
-
-    /*
-     * app_main returns here.  FreeRTOS scheduler keeps everything alive.
-     *
-     * To add a periodic background task (e.g. auto-dose when TDS is low):
-     *
-     *   xTaskCreate(auto_dose_task, "auto_dose", 4096, NULL, 5, NULL);
-     *
-     * where auto_dose_task loops, calls read_tds() / read_ph(),
-     * and calls trigger_pump() as needed.
-     */
 }
