@@ -9,6 +9,7 @@
  *   GET /          → serves the HTML dashboard
  *   GET /data      → returns { "water": %, "food": ppm, "ph": value }
  *   GET /action    → triggers water / nutrient / pH pump
+ *   GET /motor     → direct motor control: ?cmd=forward|backward|stop  ?speed=0-255
  *
  * Flash steps:
  *   1. Set WIFI_SSID, WIFI_PASSWORD, and LAPTOP_IP below.
@@ -2091,6 +2092,62 @@ static esp_err_t handler_options(httpd_req_t *req)
     return ESP_OK;
 }
 
+/*
+ * GET /motor?cmd=forward|backward|stop
+ * GET /motor?speed=0-255
+ *
+ * Direct motor control endpoint — bypasses the pump queue so the
+ * motor responds immediately to button presses from the HTML page.
+ * The speed parameter sets the PWM duty cycle on the ENA pin (GPIO 14).
+ */
+static esp_err_t handler_motor(httpd_req_t *req)
+{
+    char query[64] = {0};
+    char value[16] = {0};
+
+    add_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"no_params\"}", -1);
+        return ESP_OK;
+    }
+
+    /* Handle ?cmd=forward|backward|stop */
+    if (httpd_query_key_value(query, "cmd", value, sizeof(value)) == ESP_OK) {
+        if (strcmp(value, "forward") == 0) {
+            motor_forward(MOTOR_PWM_DEFAULT);
+        } else if (strcmp(value, "backward") == 0) {
+            motor_backward(MOTOR_PWM_DEFAULT);
+        } else if (strcmp(value, "stop") == 0) {
+            motor_stop();
+        } else {
+            ESP_LOGW(TAG, "Unknown motor cmd: %s", value);
+            httpd_resp_send(req, "{\"ok\":false,\"error\":\"unknown_cmd\"}", -1);
+            return ESP_OK;
+        }
+        ESP_LOGI(TAG, "/motor cmd=%s", value);
+        char resp[48];
+        snprintf(resp, sizeof(resp), "{\"ok\":true,\"cmd\":\"%s\"}", value);
+        httpd_resp_send(req, resp, strlen(resp));
+        return ESP_OK;
+    }
+
+    /* Handle ?speed=0-255 */
+    if (httpd_query_key_value(query, "speed", value, sizeof(value)) == ESP_OK) {
+        uint32_t duty = (uint32_t)atoi(value);
+        motor_set_speed(duty);
+        ESP_LOGI(TAG, "/motor speed=%"PRIu32, duty);
+        char resp[48];
+        snprintf(resp, sizeof(resp), "{\"ok\":true,\"speed\":%"PRIu32"}", duty);
+        httpd_resp_send(req, resp, strlen(resp));
+        return ESP_OK;
+    }
+
+    httpd_resp_send(req, "{\"ok\":false,\"error\":\"unknown_param\"}", -1);
+    return ESP_OK;
+}
+
 /* ----------------------------------------------------------------
    HTTP SERVER STARTUP
    ---------------------------------------------------------------- */
@@ -2098,7 +2155,7 @@ static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
     config.server_port     = 80;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 9;
     config.stack_size      = 16384;
 
     httpd_handle_t server = NULL;
@@ -2107,14 +2164,16 @@ static httpd_handle_t start_webserver(void)
         return NULL;
     }
 
-    httpd_uri_t uri_root = { .uri = "/",        .method = HTTP_GET,     .handler = handler_root    };
-    httpd_uri_t uri_data = { .uri = "/data",     .method = HTTP_GET,     .handler = handler_data    };
-    httpd_uri_t uri_act  = { .uri = "/action",   .method = HTTP_GET,     .handler = handler_action  };
-    httpd_uri_t uri_opts = { .uri = "/analyze",  .method = HTTP_OPTIONS, .handler = handler_options };
+    httpd_uri_t uri_root  = { .uri = "/",        .method = HTTP_GET,     .handler = handler_root    };
+    httpd_uri_t uri_data  = { .uri = "/data",     .method = HTTP_GET,     .handler = handler_data    };
+    httpd_uri_t uri_act   = { .uri = "/action",   .method = HTTP_GET,     .handler = handler_action  };
+    httpd_uri_t uri_motor = { .uri = "/motor",    .method = HTTP_GET,     .handler = handler_motor   };
+    httpd_uri_t uri_opts  = { .uri = "/analyze",  .method = HTTP_OPTIONS, .handler = handler_options };
 
     httpd_register_uri_handler(server, &uri_root);
     httpd_register_uri_handler(server, &uri_data);
     httpd_register_uri_handler(server, &uri_act);
+    httpd_register_uri_handler(server, &uri_motor);
     httpd_register_uri_handler(server, &uri_opts);
 
     ESP_LOGI(TAG, "HTTP server started on port 80");
