@@ -26,11 +26,12 @@
  *   GPIO 22 — I2C SCL → ADS1115  (TDS/Nutrients)
  *
  * BUTTON OUTPUTS
- *   GPIO 25 — Add Water  button → water pump relay
- *   GPIO 26 — Feed Plant button → nutrient pump relay
- *   GPIO 27 — Fix pH     button → L298N IN1  (motor direction)
- *   GPIO 33 — Fix pH     button → L298N IN2  (motor direction)
- *   GPIO 14 — Fix pH     button → L298N ENA  (motor speed, PWM)
+ *   GPIO 25 — Add Water     button → water pump relay
+ *   GPIO 26 — Remove Water  button → drain pump relay
+ *   GPIO 4  — Feed Plant    button → nutrient pump relay
+ *   GPIO 27 — pH Down       button → pH down dosing pump/relay
+ *   GPIO 33 — pH Up         button → pH up dosing pump/relay
+ *   GPIO 14 — optional PWM output, unused by default
  * ----------------------------------------------------------------
  */
 
@@ -73,12 +74,14 @@
    Change any value here — no need to touch the rest of the code.
 
    WATER_ON_DURATION_MS  — Add Water  button (GPIO 25 relay)
-   FOOD_ON_DURATION_MS   — Feed Plant button (GPIO 26 relay)
-   PH_ON_DURATION_MS     — Fix pH     button (GPIO 27 motor IN1)
+   FOOD_ON_DURATION_MS   — Feed Plant button (GPIO 4 relay)
+   PH_DOWN_DURATION_MS     — Fix pH     button (GPIO 27 motor IN1)
    ---------------------------------------------------------------- */
-#define WATER_ON_DURATION_MS  10000   /* milliseconds — 10 s default */
-#define FOOD_ON_DURATION_MS   10000   /* milliseconds — 10 s default */
-#define PH_ON_DURATION_MS     10000   /* milliseconds — 10 s default */
+#define WATER_ON_DURATION_MS   10000   /* Add Water — 10 s default */
+#define DRAIN_ON_DURATION_MS   10000   /* Remove Water — 10 s default */
+#define FOOD_ON_DURATION_MS    10000   /* Feed Plant — 10 s default */
+#define PH_DOWN_DURATION_MS    10000   /* pH Down — 10 s default */
+#define PH_UP_DURATION_MS      10000   /* pH Up — 10 s default */
 
 /* ----------------------------------------------------------------
    TEST_GPIO27
@@ -89,18 +92,47 @@
    ---------------------------------------------------------------- */
 #define TEST_GPIO27 0
 
+/* ================================================================
+   GPIO PINOUT — COMPLETE REFERENCE
+   ================================================================
+   INPUTS
+   ──────────────────────────────────────────────────────────────
+   GPIO 34   ADC1_CH6   Water level sensor          (analog in)
+   GPIO 32   ADC1_CH4   pH sensor — PH-4502C        (analog in)
+   GPIO 21   I2C SDA    ADS1115 → TDS / nutrients   (I2C data)
+   GPIO 22   I2C SCL    ADS1115 → TDS / nutrients   (I2C clock)
+
+   OUTPUTS
+   ──────────────────────────────────────────────────────────────
+   GPIO 25   PIN_PUMP_WATER      Add water pump      (relay)
+   GPIO 26   PIN_PUMP_DRAIN      Remove water pump   (relay)
+   GPIO  4   PIN_PUMP_NUTRIENT   Nutrient pump       (relay)
+   GPIO 27   PIN_PH_DOWN         pH down pump        (relay)
+   GPIO 33   PIN_PH_UP           pH up pump          (relay)
+   GPIO 14   MOTOR_PIN_EN        L298N motor ENA     (PWM 30 kHz, optional)
+
+   All output pins use GPIO_DRIVE_CAP_3 (max drive strength).
+   All output durations are set via the *_ON_DURATION_MS defines above.
+   ================================================================ */
+
 /* ----------------------------------------------------------------
    PIN DEFINITIONS
    ---------------------------------------------------------------- */
 #define PIN_WATER   ADC_CHANNEL_6   /* GPIO 34 */
 #define PIN_PH      ADC_CHANNEL_4   /* GPIO 32 */
 
-#define PIN_PUMP_WATER      GPIO_NUM_25
-#define PIN_PUMP_NUTRIENT   GPIO_NUM_26
+#define PIN_PUMP_WATER      GPIO_NUM_25   /* Add Water */
+#define PIN_PUMP_DRAIN      GPIO_NUM_26   /* Remove Water */
+#define PIN_PUMP_NUTRIENT   GPIO_NUM_4    /* Feed Plant */
 
-/* DC motor (L298N) for pH adjustment */
-#define MOTOR_PIN_IN1       GPIO_NUM_27
-#define MOTOR_PIN_IN2       GPIO_NUM_33
+#define PIN_PH_DOWN         GPIO_NUM_27   /* pH Down dosing pump/relay */
+#define PIN_PH_UP           GPIO_NUM_33   /* pH Up dosing pump/relay */
+
+/* Legacy motor names kept so the optional motor helper/test code still compiles. */
+#define MOTOR_PIN_IN1       PIN_PH_DOWN
+#define MOTOR_PIN_IN2       PIN_PH_UP
+
+/* Optional PWM pin kept available if you later use a motor driver */
 #define MOTOR_PIN_EN        GPIO_NUM_14
 
 #define MOTOR_PWM_FREQ      30000
@@ -314,7 +346,7 @@ static const char HTML_PAGE[] =
 "    /* PUMP PANEL */\n"
 "    .pump-panel { padding: 18px 18px 16px; }\n"
 "    .pump-label { font-size: 11px; font-weight: 900; letter-spacing: 1.2px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 12px; }\n"
-"    .pump-buttons { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; margin-bottom: 10px; }\n"
+"    .pump-buttons { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 10px; margin-bottom: 10px; }\n"
 "    .pump-btn { border: none; border-radius: 14px; padding: 13px 10px; font-family: 'Nunito', sans-serif; font-size: 13px; font-weight: 800; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 7px; color: #fff; background: var(--green); box-shadow: 0 6px 16px rgba(45,106,79,0.28), inset 0 1px 0 rgba(255,255,255,0.2); transition: transform 0.12s, box-shadow 0.12s, background 0.3s; }\n"
 "    .pump-btn:hover:not(:disabled)  { transform: translateY(-2px); }\n"
 "    .pump-btn:active:not(:disabled) { transform: translateY(0); }\n"
@@ -735,8 +767,10 @@ static const char HTML_PAGE[] =
 "    <p class=\"pump-label\">Plant controls</p>\n"
 "    <div class=\"pump-buttons\">\n"
 "      <button class=\"pump-btn\" id=\"waterPumpBtn\" type=\"button\" data-state=\"idle\"><span class=\"pump-btn-icon\">💧</span> Add Water</button>\n"
+"      <button class=\"pump-btn\" id=\"removeWaterBtn\" type=\"button\" data-state=\"idle\"><span class=\"pump-btn-icon\">🚰</span> Remove Water</button>\n"
 "      <button class=\"pump-btn\" id=\"nutrientPumpBtn\" type=\"button\" data-state=\"idle\"><span class=\"pump-btn-icon\">🧪</span> Feed Plant</button>\n"
-"      <button class=\"pump-btn\" id=\"phBtn\" type=\"button\" data-state=\"idle\"><span class=\"pump-btn-icon\">⚗️</span> Fix pH</button>\n"
+"      <button class=\"pump-btn\" id=\"phDownBtn\" type=\"button\" data-state=\"idle\"><span class=\"pump-btn-icon\">⬇️</span> pH Down</button>\n"
+"      <button class=\"pump-btn\" id=\"phUpBtn\" type=\"button\" data-state=\"idle\"><span class=\"pump-btn-icon\">⬆️</span> pH Up</button>\n"
 "    </div>\n"
 "    <p class=\"pump-note\">Pump runs automatically when levels are critical</p>\n"
 "  </div>\n"
@@ -1573,9 +1607,11 @@ static const char HTML_PAGE[] =
 "  document.getElementById(\"harvestBtn\").classList.remove(\"visible\");\n"
 "  fetchSensorData();\n"
 "});\n"
-"document.getElementById(\"waterPumpBtn\").addEventListener(\"click\",    function(){ runPump(\"waterPumpBtn\",    \"Add Water\", \"💧\", \"water\",    \"water\"); });\n"
-"document.getElementById(\"nutrientPumpBtn\").addEventListener(\"click\", function(){ runPump(\"nutrientPumpBtn\", \"Feed Plant\",\"🧪\", \"nutrient\", \"food\"); });\n"
-"document.getElementById(\"phBtn\").addEventListener(\"click\",           function(){ runPump(\"phBtn\",           \"Fix pH\",    \"⚗️\", \"ph\",       \"ph\"); });\n"
+"document.getElementById(\"waterPumpBtn\").addEventListener(\"click\",       function(){ runPump(\"waterPumpBtn\",    \"Add Water\",    \"💧\", \"water\",    \"water\"); });\n"
+"document.getElementById(\"removeWaterBtn\").addEventListener(\"click\",  function(){ runPump(\"removeWaterBtn\", \"Remove Water\", \"🚰\", \"water\",    \"drain\"); });\n"
+"document.getElementById(\"nutrientPumpBtn\").addEventListener(\"click\", function(){ runPump(\"nutrientPumpBtn\", \"Feed Plant\",   \"🧪\", \"nutrient\", \"food\"); });\n"
+"document.getElementById(\"phDownBtn\").addEventListener(\"click\",       function(){ runPump(\"phDownBtn\",      \"pH Down\",      \"⬇️\", \"ph\",       \"phdown\"); });\n"
+"document.getElementById(\"phUpBtn\").addEventListener(\"click\",         function(){ runPump(\"phUpBtn\",        \"pH Up\",        \"⬆️\", \"ph\",       \"phup\"); });\n"
 "\n"
 "(function() {\n"
 "  var devOpen = false;\n"
@@ -1641,11 +1677,7 @@ static void pump_worker(void *arg)
             ESP_LOGI(TAG, "Pump worker: action=%s pin=%d duration=%dms",
                      job.action, job.pin, job.duration_ms);
 
-            if (strcmp(job.action, "ph") == 0) {
-                motor_run_sequence();
-            } else {
-                trigger_pump(job.pin, job.duration_ms);
-            }
+            trigger_pump(job.pin, job.duration_ms);
 
             vTaskDelay(pdMS_TO_TICKS(100));
         }
@@ -1813,7 +1845,10 @@ static float read_water_level(void)
     long acc = 0;
     for (int i = 0; i < 10; i++) {
         int raw = 0;
-        adc_oneshot_read(adc_handle, PIN_WATER, &raw);
+        if (adc_oneshot_read(adc_handle, PIN_WATER, &raw) != ESP_OK) {
+            ESP_LOGW(TAG, "Water ADC read failed on sample %d", i);
+            raw = 0;
+        }
         acc += raw;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -1840,7 +1875,7 @@ static float read_tds(void)
     for (uint16_t i = 0; i < TDS_NUM_SAMPLES; i++) {
         int16_t raw = ads1115_read_a0();
         acc += raw;
-        vTaskDelay(1);
+        vTaskDelay(pdMS_TO_TICKS(10)); /* wait ≥8 ms for 128 SPS conversion */
     }
     float avg_raw = (float)acc / TDS_NUM_SAMPLES;
 
@@ -1874,7 +1909,11 @@ static float read_ph(void)
 #else
     int buf[10];
     for (int i = 0; i < 10; i++) {
-        adc_oneshot_read(adc_handle, PIN_PH, &buf[i]);
+        buf[i] = 0;
+        if (adc_oneshot_read(adc_handle, PIN_PH, &buf[i]) != ESP_OK) {
+            ESP_LOGW(TAG, "pH ADC read failed on sample %d", i);
+            buf[i] = 0;
+        }
         vTaskDelay(pdMS_TO_TICKS(30));
     }
 
@@ -1919,7 +1958,11 @@ static void trigger_pump(gpio_num_t pin, int duration_ms)
 }
 
 /* ----------------------------------------------------------------
-   DC MOTOR CONTROL (L298N on GPIO 27/33/14)
+   DC MOTOR CONTROL HELPERS (L298N on GPIO 27/33/14)
+   NOTE: These are retained for future use if a real L298N is wired.
+   Currently all pH actions use trigger_pump() via the queue, not
+   these helpers. To use them, dispatch motor_run_sequence() from
+   pump_worker instead of trigger_pump() for the phdown/phup actions.
    ---------------------------------------------------------------- */
 
 static void motor_set_speed(uint32_t duty)
@@ -1961,7 +2004,7 @@ static void motor_stop(void)
  * motor_run_sequence()
  * Called when Fix pH button is pressed.
  *
- * Currently: holds GPIO 27 HIGH for PH_ON_DURATION_MS then LOW.
+ * Currently: holds GPIO 27 HIGH for PH_DOWN_DURATION_MS then LOW.
  * Simple and controllable — good for LED testing.
  *
  * When the real L298N motor is connected, replace the body with:
@@ -1972,30 +2015,19 @@ static void motor_stop(void)
  */
 static void motor_run_sequence(void)
 {
-    ESP_LOGI(TAG, "pH: GPIO 27 HIGH for %d ms", PH_ON_DURATION_MS);
+    ESP_LOGI(TAG, "pH: GPIO 27 HIGH for %d ms", PH_DOWN_DURATION_MS);
     gpio_set_level(MOTOR_PIN_IN1, 1);           /* GPIO 27 → 3.3V, LED ON  */
-    vTaskDelay(pdMS_TO_TICKS(PH_ON_DURATION_MS));
+    vTaskDelay(pdMS_TO_TICKS(PH_DOWN_DURATION_MS));
     gpio_set_level(MOTOR_PIN_IN1, 0);           /* GPIO 27 → 0V,   LED OFF */
     ESP_LOGI(TAG, "pH: GPIO 27 LOW");
 }
 
-/* Configures GPIO 27 (IN1), GPIO 33 (IN2), and LEDC PWM on GPIO 14 (ENA). */
+/* Configures LEDC PWM on GPIO 14 (ENA) only.
+   GPIO 27 (IN1/PIN_PH_DOWN) and GPIO 33 (IN2/PIN_PH_UP) are configured
+   as outputs by gpio_init_pumps() — no need to repeat that here. */
 static void motor_init(void)
 {
-    gpio_config_t dir_conf = {
-        .pin_bit_mask = (1ULL << MOTOR_PIN_IN1) | (1ULL << MOTOR_PIN_IN2),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&dir_conf);
-    gpio_set_level(MOTOR_PIN_IN1, 0);
-    gpio_set_level(MOTOR_PIN_IN2, 0);
-
-    /* Max drive strength — ensures GPIO 27 reaches full 3.3V output */
-    gpio_set_drive_capability(MOTOR_PIN_IN1, GPIO_DRIVE_CAP_3);
-    gpio_set_drive_capability(MOTOR_PIN_IN2, GPIO_DRIVE_CAP_3);
+    /* Drive-strength boost is done in gpio_init_pumps; skip gpio_config here. */
 
     ledc_timer_config_t timer_conf = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
@@ -2043,7 +2075,7 @@ static esp_err_t handler_root(httpd_req_t *req)
 {
     add_cors_headers(req);
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, HTML_PAGE, strlen(HTML_PAGE));
+    httpd_resp_send(req, HTML_PAGE, sizeof(HTML_PAGE) - 1);
     return ESP_OK;
 }
 
@@ -2068,7 +2100,7 @@ static esp_err_t handler_data(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* GET /action?action=water|food|ph — enqueues a pump or motor job.
+/* GET /action?action=water|drain|food|phdown|phup — enqueues an output job.
    Returns {"ok":true,"duration":<ms>} so the HTML button stays in
    "Running..." for exactly as long as the hardware actually runs. */
 static esp_err_t handler_action(httpd_req_t *req)
@@ -2084,14 +2116,22 @@ static esp_err_t handler_action(httpd_req_t *req)
                 job.pin = PIN_PUMP_WATER; job.duration_ms = WATER_ON_DURATION_MS;
                 snprintf(job.action, sizeof(job.action), "%s", "water");
                 duration_to_report = WATER_ON_DURATION_MS;
+            } else if (strcmp(action, "drain") == 0) {
+                job.pin = PIN_PUMP_DRAIN; job.duration_ms = DRAIN_ON_DURATION_MS;
+                snprintf(job.action, sizeof(job.action), "%s", "drain");
+                duration_to_report = DRAIN_ON_DURATION_MS;
             } else if (strcmp(action, "food") == 0) {
                 job.pin = PIN_PUMP_NUTRIENT; job.duration_ms = FOOD_ON_DURATION_MS;
                 snprintf(job.action, sizeof(job.action), "%s", "food");
                 duration_to_report = FOOD_ON_DURATION_MS;
-            } else if (strcmp(action, "ph") == 0) {
-                job.pin = 0; job.duration_ms = 0;
-                snprintf(job.action, sizeof(job.action), "%s", "ph");
-                duration_to_report = PH_ON_DURATION_MS;
+            } else if (strcmp(action, "phdown") == 0) {
+                job.pin = PIN_PH_DOWN; job.duration_ms = PH_DOWN_DURATION_MS;
+                snprintf(job.action, sizeof(job.action), "%s", "phdown");
+                duration_to_report = PH_DOWN_DURATION_MS;
+            } else if (strcmp(action, "phup") == 0) {
+                job.pin = PIN_PH_UP; job.duration_ms = PH_UP_DURATION_MS;
+                snprintf(job.action, sizeof(job.action), "%s", "phup");
+                duration_to_report = PH_UP_DURATION_MS;
             } else {
                 ESP_LOGW(TAG, "Unknown action: %s", action);
                 add_cors_headers(req);
@@ -2108,7 +2148,21 @@ static esp_err_t handler_action(httpd_req_t *req)
                 return ESP_OK;
             }
             ESP_LOGI(TAG, "Enqueued action=%s duration=%" PRId32 "ms", job.action, duration_to_report);
+        } else {
+            /* Query string present but no "action" key */
+            ESP_LOGW(TAG, "/action called with no 'action' parameter");
+            add_cors_headers(req);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, "{\"ok\":false,\"error\":\"missing_action\"}", strlen("{\"ok\":false,\"error\":\"missing_action\"}"));
+            return ESP_OK;
         }
+    } else {
+        /* No query string at all */
+        ESP_LOGW(TAG, "/action called with no query string");
+        add_cors_headers(req);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"missing_action\"}", strlen("{\"ok\":false,\"error\":\"missing_action\"}"));
+        return ESP_OK;
     }
 
     /* Send duration back so the HTML button syncs its Running... timer */
@@ -2165,7 +2219,11 @@ static httpd_handle_t start_webserver(void)
 static void gpio_init_pumps(void)
 {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << PIN_PUMP_WATER) | (1ULL << PIN_PUMP_NUTRIENT),
+        .pin_bit_mask = (1ULL << PIN_PUMP_WATER) |
+                        (1ULL << PIN_PUMP_DRAIN) |
+                        (1ULL << PIN_PUMP_NUTRIENT) |
+                        (1ULL << PIN_PH_DOWN) |
+                        (1ULL << PIN_PH_UP),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -2175,12 +2233,18 @@ static void gpio_init_pumps(void)
 
     /* Max drive strength — ensures GPIO 25 and 26 reach full 3.3V output */
     gpio_set_drive_capability(PIN_PUMP_WATER,    GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(PIN_PUMP_DRAIN,    GPIO_DRIVE_CAP_3);
     gpio_set_drive_capability(PIN_PUMP_NUTRIENT, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(PIN_PH_DOWN,       GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(PIN_PH_UP,         GPIO_DRIVE_CAP_3);
 
     gpio_set_level(PIN_PUMP_WATER,    0);
+    gpio_set_level(PIN_PUMP_DRAIN,    0);
     gpio_set_level(PIN_PUMP_NUTRIENT, 0);
+    gpio_set_level(PIN_PH_DOWN,       0);
+    gpio_set_level(PIN_PH_UP,         0);
 
-    ESP_LOGI(TAG, "Pump GPIOs configured (25, 26) — all OFF, drive=MAX");
+    ESP_LOGI(TAG, "Output GPIOs configured — water:25 drain:26 nutrient:4 pH-down:27 pH-up:33, all OFF");
 }
 
 /* ================================================================
