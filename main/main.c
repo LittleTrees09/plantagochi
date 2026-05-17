@@ -68,7 +68,7 @@
 #define WIFI_AP_MAX_CONN    4
 
 /* 1 = fake sensor data for testing, 0 = real sensors */
-#define SIMULATE_SENSORS 1
+#define SIMULATE_SENSORS 0
 #if SIMULATE_SENSORS
 #pragma message("SIMULATE_SENSORS is 1 — fake data active. Set to 0 before flashing to real hardware.")
 #endif
