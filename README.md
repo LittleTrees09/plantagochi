@@ -253,10 +253,10 @@ All autocorrect settings are in `main/main.c` (~line 95). Change any value here 
 
 /* Timing */
 #define AUTO_DOSE_MS             2000    /* how long each pump pulse runs (ms) */
-#define AUTO_CHECK_INTERVAL_MS  60000    /* how often sensors are evaluated (ms) */
-#define AUTO_PH_COOLDOWN_MS    600000    /* min gap between pH corrections — 10 min */
-#define AUTO_TDS_COOLDOWN_MS   120000    /* min gap between nutrient corrections — 2 min */
-#define AUTO_WATER_COOLDOWN_MS 120000    /* min gap between water level corrections — 2 min */
+#define AUTO_CHECK_INTERVAL_MS  10000    /* how often sensors are evaluated (ms) */
+#define AUTO_PH_COOLDOWN_MS     60000    /* min gap between pH corrections — 1 min */
+#define AUTO_TDS_COOLDOWN_MS    60000    /* min gap between nutrient corrections — 1 min */
+#define AUTO_WATER_COOLDOWN_MS  60000    /* min gap between water level corrections — 1 min */
 ```
 
 ### Correction cycle (example — TDS too low)
