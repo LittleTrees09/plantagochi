@@ -61,7 +61,7 @@
    ---------------------------------------------------------------- */
 #define WIFI_SSID       "PLANTAGOCHI"
 #define WIFI_PASSWORD   "12345678"
-#define LAPTOP_IP       "YOUR_LAPTOP_IP"   /* laptop IP on the AP network */
+#define LAPTOP_IP       "192.168.4.1"   /* laptop IP on the AP network */
 #pragma message("LAPTOP_IP is still set to the placeholder — update it before flashing to hardware")
 
 #define WIFI_AP_CHANNEL     1
