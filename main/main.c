@@ -89,6 +89,23 @@
 #define PH_UP_DURATION_MS      10000   /* pH Up — 10 s default */
 
 /* ----------------------------------------------------------------
+   AUTOCORRECT THRESHOLDS & TIMING
+   Tune these to match your crop and reservoir size.
+   ---------------------------------------------------------------- */
+#define AUTO_PH_MIN              5.5f    /* dose pH Up  when pH drops below this */
+#define AUTO_PH_MAX              6.5f    /* dose pH Down when pH rises above this */
+#define AUTO_TDS_MIN             400.0f  /* dose nutrients when TDS drops below this (ppm) */
+#define AUTO_TDS_MAX            1200.0f  /* add plain water to dilute when TDS exceeds this (ppm) */
+#define AUTO_WATER_MIN           30.0f   /* add water when level drops below this (%) */
+#define AUTO_WATER_MAX           90.0f   /* drain when level rises above this (%) */
+
+#define AUTO_DOSE_MS             2000    /* short pump pulse per correction (ms) */
+#define AUTO_CHECK_INTERVAL_MS  10000    /* how often autocorrect evaluates sensors (ms) */
+#define AUTO_PH_COOLDOWN_MS     60000    /* min gap between pH corrections — 1 min to let solution mix */
+#define AUTO_TDS_COOLDOWN_MS    60000    /* min gap between nutrient corrections — 1 min */
+#define AUTO_WATER_COOLDOWN_MS  60000    /* min gap between water level corrections — 1 min */
+
+/* ----------------------------------------------------------------
    TEST_GPIO27
    1 = run the GPIO 27 LED blink test instead of normal firmware
    0 = normal Plantagochi operation (leave this at 0 when done)
@@ -1873,7 +1890,7 @@ static float read_water_level(void)
 static float read_tds(void)
 {
 #if SIMULATE_SENSORS
-    return 700.0f + ((rand() % 1000 - 500) / 10.0f);
+    return 200.0f; /* forced low → triggers auto nutrient pump */
 #else
     long acc = 0;
     for (uint16_t i = 0; i < TDS_NUM_SAMPLES; i++) {
@@ -1960,20 +1977,134 @@ typedef struct {
 static sensor_cache_t   s_cache       = { 72.0f, 700.0f, 6.1f };
 static SemaphoreHandle_t s_cache_mutex = NULL;
 
+/* Autocorrect — 0 = off (default), 1 = on */
+static volatile int s_autocorrect_enabled = 1;
+static TickType_t   s_last_ph_dose        = 0;  /* 0 = never dosed */
+static TickType_t   s_last_tds_dose       = 0;
+static TickType_t   s_last_water_dose     = 0;
+
+/* Sensor injection — when 1, sensor_task skips cache writes so injected values persist */
+static volatile int s_sensor_override = 0;
+
 static void sensor_task(void *arg)
 {
     for (;;) {
-        float w = read_water_level();
-        float f = read_tds();
-        float p = read_ph();
-        if (s_cache_mutex &&
-            xSemaphoreTake(s_cache_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            s_cache.water = w;
-            s_cache.food  = f;
-            s_cache.ph    = p;
-            xSemaphoreGive(s_cache_mutex);
+        if (!s_sensor_override) {
+            float w = read_water_level();
+            float f = read_tds();
+            float p = read_ph();
+            if (s_cache_mutex &&
+                xSemaphoreTake(s_cache_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                s_cache.water = w;
+                s_cache.food  = f;
+                s_cache.ph    = p;
+                xSemaphoreGive(s_cache_mutex);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+/* ----------------------------------------------------------------
+   AUTOCORRECT TASK
+   Runs every AUTO_CHECK_INTERVAL_MS. Reads the sensor cache and
+   queues one correction pulse when a value is out of range.
+   Priority order: pH → nutrients → water level.
+   Each parameter has its own cooldown so the solution can mix
+   before the next dose is allowed.
+   ---------------------------------------------------------------- */
+static void autocorrect_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(AUTO_CHECK_INTERVAL_MS));
+
+        if (!s_autocorrect_enabled) continue;
+
+        float water, food, ph;
+        if (!s_cache_mutex ||
+            xSemaphoreTake(s_cache_mutex, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+        water = s_cache.water;
+        food  = s_cache.food;
+        ph    = s_cache.ph;
+        xSemaphoreGive(s_cache_mutex);
+
+        TickType_t now = xTaskGetTickCount();
+        pump_job_t job;
+        bool dosed = false;
+
+        /* --- pH correction (highest priority) --- */
+        if (!dosed) {
+            bool cooldown_ok = (s_last_ph_dose == 0) ||
+                               ((now - s_last_ph_dose) >= pdMS_TO_TICKS(AUTO_PH_COOLDOWN_MS));
+            if (cooldown_ok) {
+                if (ph > AUTO_PH_MAX) {
+                    job.pin = PIN_PH_DOWN; job.duration_ms = AUTO_DOSE_MS;
+                    snprintf(job.action, sizeof(job.action), "auto:phdown");
+                    if (pump_queue && xQueueSend(pump_queue, &job, 0) == pdTRUE) {
+                        s_last_ph_dose = now; dosed = true;
+                        ESP_LOGI(TAG, "[AUTO] pH=%.2f > %.1f → pH Down %d ms", ph, AUTO_PH_MAX, AUTO_DOSE_MS);
+                    }
+                } else if (ph < AUTO_PH_MIN) {
+                    job.pin = PIN_PH_UP; job.duration_ms = AUTO_DOSE_MS;
+                    snprintf(job.action, sizeof(job.action), "auto:phup");
+                    if (pump_queue && xQueueSend(pump_queue, &job, 0) == pdTRUE) {
+                        s_last_ph_dose = now; dosed = true;
+                        ESP_LOGI(TAG, "[AUTO] pH=%.2f < %.1f → pH Up %d ms", ph, AUTO_PH_MIN, AUTO_DOSE_MS);
+                    }
+                }
+            }
+        }
+
+        /* --- TDS / nutrient correction --- */
+        if (!dosed) {
+            bool cooldown_ok = (s_last_tds_dose == 0) ||
+                               ((now - s_last_tds_dose) >= pdMS_TO_TICKS(AUTO_TDS_COOLDOWN_MS));
+            if (cooldown_ok) {
+                if (food < AUTO_TDS_MIN) {
+                    job.pin = PIN_PUMP_NUTRIENT; job.duration_ms = AUTO_DOSE_MS;
+                    snprintf(job.action, sizeof(job.action), "auto:food");
+                    if (pump_queue && xQueueSend(pump_queue, &job, 0) == pdTRUE) {
+                        s_last_tds_dose = now; dosed = true;
+                        ESP_LOGI(TAG, "[AUTO] TDS=%.0f < %.0f → Nutrient %d ms", food, AUTO_TDS_MIN, AUTO_DOSE_MS);
+                    }
+                } else if (food > AUTO_TDS_MAX) {
+                    /* Too concentrated — dilute with plain water */
+                    job.pin = PIN_PUMP_WATER; job.duration_ms = AUTO_DOSE_MS;
+                    snprintf(job.action, sizeof(job.action), "auto:dilute");
+                    if (pump_queue && xQueueSend(pump_queue, &job, 0) == pdTRUE) {
+                        s_last_tds_dose = now; dosed = true;
+                        ESP_LOGI(TAG, "[AUTO] TDS=%.0f > %.0f → Dilute (add water) %d ms", food, AUTO_TDS_MAX, AUTO_DOSE_MS);
+                    }
+                }
+            }
+        }
+
+        /* --- Water level correction --- */
+        if (!dosed) {
+            bool cooldown_ok = (s_last_water_dose == 0) ||
+                               ((now - s_last_water_dose) >= pdMS_TO_TICKS(AUTO_WATER_COOLDOWN_MS));
+            if (cooldown_ok) {
+                if (water < AUTO_WATER_MIN) {
+                    job.pin = PIN_PUMP_WATER; job.duration_ms = AUTO_DOSE_MS;
+                    snprintf(job.action, sizeof(job.action), "auto:water");
+                    if (pump_queue && xQueueSend(pump_queue, &job, 0) == pdTRUE) {
+                        s_last_water_dose = now; dosed = true;
+                        ESP_LOGI(TAG, "[AUTO] Water=%.1f%% < %.0f%% → Add water %d ms", water, AUTO_WATER_MIN, AUTO_DOSE_MS);
+                    }
+                } else if (water > AUTO_WATER_MAX) {
+                    job.pin = PIN_PUMP_DRAIN; job.duration_ms = AUTO_DOSE_MS;
+                    snprintf(job.action, sizeof(job.action), "auto:drain");
+                    if (pump_queue && xQueueSend(pump_queue, &job, 0) == pdTRUE) {
+                        s_last_water_dose = now; dosed = true;
+                        ESP_LOGI(TAG, "[AUTO] Water=%.1f%% > %.0f%% → Drain %d ms", water, AUTO_WATER_MAX, AUTO_DOSE_MS);
+                    }
+                }
+            }
+        }
+
+        if (!dosed) {
+            ESP_LOGI(TAG, "[AUTO] All OK — pH:%.2f TDS:%.0fppm Water:%.1f%%", ph, food, water);
+        }
     }
 }
 
@@ -2231,6 +2362,75 @@ static esp_err_t handler_options(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /inject?ph=7.5&tds=200&water=20  → locks cache to these values (sensor_task paused)
+   GET /inject?reset=1                  → releases lock, sensor_task resumes
+   GET /inject                          → returns current override state */
+static esp_err_t handler_inject(httpd_req_t *req)
+{
+    char param[64] = {0};
+    char val[16]   = {0};
+
+    if (httpd_req_get_url_query_str(req, param, sizeof(param)) == ESP_OK) {
+        if (httpd_query_key_value(param, "reset", val, sizeof(val)) == ESP_OK && val[0] == '1') {
+            s_sensor_override = 0;
+            ESP_LOGI(TAG, "[INJECT] Override released — sensor_task resumed");
+        } else {
+            float ph = s_cache.ph, tds = s_cache.food, water = s_cache.water;
+            if (httpd_query_key_value(param, "ph",    val, sizeof(val)) == ESP_OK) ph    = strtof(val, NULL);
+            if (httpd_query_key_value(param, "tds",   val, sizeof(val)) == ESP_OK) tds   = strtof(val, NULL);
+            if (httpd_query_key_value(param, "water", val, sizeof(val)) == ESP_OK) water = strtof(val, NULL);
+            if (s_cache_mutex &&
+                xSemaphoreTake(s_cache_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                s_cache.ph    = ph;
+                s_cache.food  = tds;
+                s_cache.water = water;
+                xSemaphoreGive(s_cache_mutex);
+            }
+            s_sensor_override = 1;
+            ESP_LOGI(TAG, "[INJECT] Locked → ph:%.2f tds:%.0f water:%.1f%%", ph, tds, water);
+        }
+    }
+
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"override\":%s,\"ph\":%.2f,\"tds\":%.0f,\"water\":%.1f}",
+             s_sensor_override ? "true" : "false",
+             s_cache.ph, s_cache.food, s_cache.water);
+    add_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+    return ESP_OK;
+}
+
+/* GET /autocorrect          → returns {"autocorrect":true|false}
+   GET /autocorrect?enabled=1 → enables autocorrect
+   GET /autocorrect?enabled=0 → disables autocorrect */
+static esp_err_t handler_autocorrect(httpd_req_t *req)
+{
+    char param[32] = {0};
+    char val[8]    = {0};
+
+    if (httpd_req_get_url_query_str(req, param, sizeof(param)) == ESP_OK) {
+        if (httpd_query_key_value(param, "enabled", val, sizeof(val)) == ESP_OK) {
+            s_autocorrect_enabled = (val[0] == '1') ? 1 : 0;
+            /* Reset cooldowns so new state takes effect cleanly */
+            if (s_autocorrect_enabled) {
+                s_last_ph_dose    = 0;
+                s_last_tds_dose   = 0;
+                s_last_water_dose = 0;
+            }
+            ESP_LOGI(TAG, "Autocorrect %s via HTTP", s_autocorrect_enabled ? "ENABLED" : "DISABLED");
+        }
+    }
+
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"autocorrect\":%s}",
+             s_autocorrect_enabled ? "true" : "false");
+    add_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+    return ESP_OK;
+}
+
 /* ----------------------------------------------------------------
    HTTP SERVER STARTUP
    ---------------------------------------------------------------- */
@@ -2238,7 +2438,7 @@ static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
     config.server_port     = 80;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 10;
     config.stack_size      = 16384;
 
     httpd_handle_t server = NULL;
@@ -2247,15 +2447,19 @@ static httpd_handle_t start_webserver(void)
         return NULL;
     }
 
-    httpd_uri_t uri_root = { .uri = "/",       .method = HTTP_GET,     .handler = handler_root    };
-    httpd_uri_t uri_data = { .uri = "/data",    .method = HTTP_GET,     .handler = handler_data    };
-    httpd_uri_t uri_act  = { .uri = "/action",  .method = HTTP_GET,     .handler = handler_action  };
-    httpd_uri_t uri_opts = { .uri = "/analyze", .method = HTTP_OPTIONS, .handler = handler_options };
+    httpd_uri_t uri_root  = { .uri = "/",            .method = HTTP_GET,     .handler = handler_root        };
+    httpd_uri_t uri_data  = { .uri = "/data",         .method = HTTP_GET,     .handler = handler_data        };
+    httpd_uri_t uri_act   = { .uri = "/action",       .method = HTTP_GET,     .handler = handler_action      };
+    httpd_uri_t uri_opts  = { .uri = "/analyze",      .method = HTTP_OPTIONS, .handler = handler_options     };
+    httpd_uri_t uri_auto   = { .uri = "/autocorrect",  .method = HTTP_GET, .handler = handler_autocorrect };
+    httpd_uri_t uri_inject = { .uri = "/inject",       .method = HTTP_GET, .handler = handler_inject      };
 
     httpd_register_uri_handler(server, &uri_root);
     httpd_register_uri_handler(server, &uri_data);
     httpd_register_uri_handler(server, &uri_act);
     httpd_register_uri_handler(server, &uri_opts);
+    httpd_register_uri_handler(server, &uri_auto);
+    httpd_register_uri_handler(server, &uri_inject);
 
     ESP_LOGI(TAG, "HTTP server started on port 80");
     return server;
@@ -2428,6 +2632,13 @@ void app_main(void)
             ESP_LOGE(TAG, "Failed to start sensor task");
         } else {
             ESP_LOGI(TAG, "Sensor task started (5 s poll interval)");
+        }
+
+        BaseType_t ac_ok = xTaskCreate(autocorrect_task, "autocorrect", 3072, NULL, 3, NULL);
+        if (ac_ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start autocorrect task");
+        } else {
+            ESP_LOGI(TAG, "Autocorrect task started (disabled by default — enable via GET /autocorrect?enabled=1)");
         }
     }
 

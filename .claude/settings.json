@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(IDF_PYTHON_ENV_PATH=/home/jm/.espressif/tools/python/v6.0/venv /home/jm/.espressif/tools/python/v6.0/venv/bin/python /home/jm/.espressif/v6.0/esp-idf/tools/idf.py build)"
+    ]
+  }
+}

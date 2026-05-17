@@ -203,7 +203,86 @@ Set back to `0` before normal use.
 
 ---
 
-## 7. Full Pin Reference
+## 7. Autocorrect
+
+Autocorrect is a background task that runs on the ESP32 and automatically fires the correct pump when a sensor value goes out of its healthy range — no button press needed.
+
+### How it works
+
+Every `AUTO_CHECK_INTERVAL_MS` milliseconds the ESP32 reads the latest sensor values and checks them against the thresholds. If a value is out of range, it queues a short pump pulse (`AUTO_DOSE_MS`). After dosing, a per-parameter cooldown prevents the same pump from firing again too soon, giving the solution time to mix before the next check.
+
+**Priority order (only one correction fires per cycle):**
+1. pH — highest priority
+2. Nutrients (TDS)
+3. Water level
+
+### Enabling autocorrect in code
+
+**File**: `main/main.c` — line ~1981
+
+```c
+static volatile int s_autocorrect_enabled = 1;  /* 1 = on, 0 = off */
+```
+
+Set to `1` to enable on boot. Set to `0` to keep it off until triggered via HTTP.
+
+### Enabling/disabling at runtime (no reflash needed)
+
+While connected to the **PLANTAGOCHI** Wi-Fi, open in a browser:
+
+| URL | Effect |
+|-----|--------|
+| `http://192.168.4.1/autocorrect?enabled=1` | Turn autocorrect ON |
+| `http://192.168.4.1/autocorrect?enabled=0` | Turn autocorrect OFF |
+| `http://192.168.4.1/autocorrect` | Check current status |
+
+Returns JSON: `{"autocorrect": true}` or `{"autocorrect": false}`.
+
+### Configurable defines
+
+All autocorrect settings are in `main/main.c` (~line 95). Change any value here without touching the rest of the code:
+
+```c
+/* Target ranges — correction fires when value goes outside these */
+#define AUTO_PH_MIN              5.5f    /* dose pH Up  when pH drops below this */
+#define AUTO_PH_MAX              6.5f    /* dose pH Down when pH rises above this */
+#define AUTO_TDS_MIN             400.0f  /* dose nutrients when TDS drops below this (ppm) */
+#define AUTO_TDS_MAX            1200.0f  /* add water to dilute when TDS exceeds this (ppm) */
+#define AUTO_WATER_MIN           30.0f   /* add water when level drops below this (%) */
+#define AUTO_WATER_MAX           90.0f   /* drain when level rises above this (%) */
+
+/* Timing */
+#define AUTO_DOSE_MS             2000    /* how long each pump pulse runs (ms) */
+#define AUTO_CHECK_INTERVAL_MS  60000    /* how often sensors are evaluated (ms) */
+#define AUTO_PH_COOLDOWN_MS    600000    /* min gap between pH corrections — 10 min */
+#define AUTO_TDS_COOLDOWN_MS   120000    /* min gap between nutrient corrections — 2 min */
+#define AUTO_WATER_COOLDOWN_MS 120000    /* min gap between water level corrections — 2 min */
+```
+
+### Correction cycle (example — TDS too low)
+
+```
+T+0s   ESP32 boots, autocorrect task starts
+T+10s  Check: TDS=200 < 400 → nutrient pump ON for 2s
+T+12s  Pump stops → 2-minute cooldown starts
+T+72s  Cooldown ends
+T+82s  Check again: TDS still low → nutrient pump fires again
+       ...repeats until TDS rises above AUTO_TDS_MIN
+```
+
+### Serial monitor output
+
+Every cycle prints one of these:
+```
+[AUTO] All OK — pH:6.10 TDS:650ppm Water:72.0%
+[AUTO] TDS=200 < 400 → Nutrient 2000 ms
+[AUTO] pH=7.20 > 6.5 → pH Down 2000 ms
+[AUTO] Water=20.0% < 30% → Add water 2000 ms
+```
+
+---
+
+## 8. Full Pin Reference
 
 | GPIO | Role | Direction | Notes |
 |------|------|-----------|-------|
