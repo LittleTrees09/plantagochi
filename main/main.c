@@ -42,6 +42,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -61,12 +62,16 @@
 #define WIFI_SSID       "PLANTAGOCHI"
 #define WIFI_PASSWORD   "12345678"
 #define LAPTOP_IP       "YOUR_LAPTOP_IP"   /* laptop IP on the AP network */
+#pragma message("LAPTOP_IP is still set to the placeholder — update it before flashing to hardware")
 
 #define WIFI_AP_CHANNEL     1
 #define WIFI_AP_MAX_CONN    4
 
 /* 1 = fake sensor data for testing, 0 = real sensors */
 #define SIMULATE_SENSORS 1
+#if SIMULATE_SENSORS
+#pragma message("SIMULATE_SENSORS is 1 — fake data active. Set to 0 before flashing to real hardware.")
+#endif
 
 /* ----------------------------------------------------------------
    PUMP / MOTOR ON DURATIONS
@@ -1667,7 +1672,6 @@ typedef struct {
 static QueueHandle_t pump_queue = NULL;
 
 static void trigger_pump(gpio_num_t pin, int duration_ms);
-static void motor_run_sequence(void);
 
 static void pump_worker(void *arg)
 {
@@ -1755,7 +1759,7 @@ static void adc_init(void)
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc_handle));
 
-    /* 12-bit, 11 dB attenuation → ~0–3.1 V input range */
+    /* 12-bit, 12 dB attenuation → ~0–3.1 V input range */
     adc_oneshot_chan_cfg_t chan_cfg = {
         .bitwidth = ADC_BITWIDTH_12,
         .atten    = ADC_ATTEN_DB_12,
@@ -1944,6 +1948,36 @@ static float read_ph(void)
 }
 
 /* ----------------------------------------------------------------
+   SENSOR CACHE — polled by a background task every 5 s so HTTP
+   handlers never block waiting for slow ADC/I2C reads (~1 s total).
+   ---------------------------------------------------------------- */
+typedef struct {
+    float water;
+    float food;
+    float ph;
+} sensor_cache_t;
+
+static sensor_cache_t   s_cache       = { 72.0f, 700.0f, 6.1f };
+static SemaphoreHandle_t s_cache_mutex = NULL;
+
+static void sensor_task(void *arg)
+{
+    for (;;) {
+        float w = read_water_level();
+        float f = read_tds();
+        float p = read_ph();
+        if (s_cache_mutex &&
+            xSemaphoreTake(s_cache_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            s_cache.water = w;
+            s_cache.food  = f;
+            s_cache.ph    = p;
+            xSemaphoreGive(s_cache_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+/* ----------------------------------------------------------------
    PUMP CONTROL
    ---------------------------------------------------------------- */
 
@@ -2079,12 +2113,19 @@ static esp_err_t handler_root(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* GET /data — returns sensor readings as JSON */
+/* GET /data — returns cached sensor readings as JSON (updated every 5 s by sensor_task) */
 static esp_err_t handler_data(httpd_req_t *req)
 {
-    float water = read_water_level();
-    float food  = read_tds();
-    float ph    = read_ph();
+    float water, food, ph;
+    if (s_cache_mutex &&
+        xSemaphoreTake(s_cache_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        water = s_cache.water;
+        food  = s_cache.food;
+        ph    = s_cache.ph;
+        xSemaphoreGive(s_cache_mutex);
+    } else {
+        water = 0.0f; food = 0.0f; ph = 0.0f;
+    }
 
     char json[128];
     snprintf(json, sizeof(json),
@@ -2140,8 +2181,15 @@ static esp_err_t handler_action(httpd_req_t *req)
                 return ESP_OK;
             }
 
-            if (pump_queue == NULL || xQueueSend(pump_queue, &job, 0) != pdTRUE) {
-                ESP_LOGW(TAG, "Pump queue full \xe2\x80\x94 action=%s", job.action);
+            if (pump_queue == NULL) {
+                ESP_LOGW(TAG, "Pump queue not initialized — action=%s", job.action);
+                add_cors_headers(req);
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_send(req, "{\"ok\":false,\"error\":\"not_initialized\"}", strlen("{\"ok\":false,\"error\":\"not_initialized\"}"));
+                return ESP_OK;
+            }
+            if (xQueueSend(pump_queue, &job, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "Pump queue full — action=%s", job.action);
                 add_cors_headers(req);
                 httpd_resp_set_type(req, "application/json");
                 httpd_resp_send(req, "{\"ok\":false,\"error\":\"queue_full\"}", strlen("{\"ok\":false,\"error\":\"queue_full\"}"));
@@ -2229,7 +2277,7 @@ static void gpio_init_pumps(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io_conf);
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
 
     /* Max drive strength — ensures GPIO 25 and 26 reach full 3.3V output */
     gpio_set_drive_capability(PIN_PUMP_WATER,    GPIO_DRIVE_CAP_3);
@@ -2310,7 +2358,7 @@ void app_main(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
-    gpio_config(&cfg);
+    ESP_ERROR_CHECK(gpio_config(&cfg));
     gpio_set_level(MOTOR_PIN_IN1, 0);
     ESP_LOGI(TAG, "[TEST] GPIO %d configured as output, starting LOW", MOTOR_PIN_IN1);
 
@@ -2361,6 +2409,8 @@ void app_main(void)
         BaseType_t ok = xTaskCreate(pump_worker, "pump_worker", 2048, NULL, 5, NULL);
         if (ok != pdPASS) {
             ESP_LOGE(TAG, "Failed to start pump worker task");
+            vQueueDelete(pump_queue);
+            pump_queue = NULL;
         } else {
             ESP_LOGI(TAG, "Pump worker started (queue len=8)");
         }
@@ -2369,9 +2419,23 @@ void app_main(void)
     adc_init();
     i2c_master_init();
 
+    s_cache_mutex = xSemaphoreCreateMutex();
+    if (s_cache_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create sensor cache mutex");
+    } else {
+        BaseType_t ok = xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 4, NULL);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start sensor task");
+        } else {
+            ESP_LOGI(TAG, "Sensor task started (5 s poll interval)");
+        }
+    }
+
     ESP_LOGI(TAG, "Starting Wi-Fi AP: %s", WIFI_SSID);
     wifi_init();
-    start_webserver();
+    if (start_webserver() == NULL) {
+        ESP_LOGE(TAG, "HTTP server failed to start");
+    }
 
     ESP_LOGI(TAG, "System ready.");
     ESP_LOGI(TAG, "Connect to Wi-Fi \"%s\", then open http://192.168.4.1", WIFI_SSID);
