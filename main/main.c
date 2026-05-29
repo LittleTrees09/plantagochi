@@ -105,15 +105,6 @@
 #define AUTO_TDS_COOLDOWN_MS    60000    /* min gap between nutrient corrections — 1 min */
 #define AUTO_WATER_COOLDOWN_MS  60000    /* min gap between water level corrections — 1 min */
 
-/* ----------------------------------------------------------------
-   TEST_GPIO27
-   1 = run the GPIO 27 LED blink test instead of normal firmware
-   0 = normal Plantagochi operation (leave this at 0 when done)
-
-   Circuit: GPIO 27 ──── 330Ω ──── LED(+) ──── LED(–) ──── GND
-   ---------------------------------------------------------------- */
-#define TEST_GPIO27 0
-
 /* ================================================================
    GPIO PINOUT — COMPLETE REFERENCE
    ================================================================
@@ -2502,89 +2493,6 @@ static void gpio_init_pumps(void)
     ESP_LOGI(TAG, "Output GPIOs configured — water:25 drain:26 nutrient:4 pH-down:27 pH-up:33, all OFF");
 }
 
-/* ================================================================
-   TEST — GPIO 27 OUTPUT VERIFICATION
-   ════════════════════════════════════════════════════════════════
-   Enable by setting  #define TEST_GPIO27 1  near the top.
-   Set back to 0 before deploying — this replaces app_main entirely
-   and the normal firmware will NOT run while the test is active.
-
-   What to expect (repeating forever):
-     Phase 1 — SLOW BLINK x5  : 500 ms ON / 500 ms OFF
-     Phase 2 — HOLD HIGH 3 s  : LED stays solid ON
-     Phase 3 — HOLD LOW  2 s  : LED stays OFF
-     Phase 4 — FAST BLINK x10 : 100 ms ON / 100 ms OFF
-
-   If the LED does not light during Phase 2 (HOLD HIGH):
-     - Flip the LED — long leg to resistor, short leg to GND
-     - Confirm the 330Ohm is between GPIO 27 and the LED (+)
-     - Check you actually flashed with TEST_GPIO27 1
-   ================================================================ */
-#if TEST_GPIO27
-
-static void _test_pin_set(int level)
-{
-    gpio_set_level(MOTOR_PIN_IN1, level);
-    ESP_LOGI(TAG, "[TEST] GPIO %d -> %s  (%s)",
-             MOTOR_PIN_IN1,
-             level ? "HIGH (3.3V)" : "LOW  (0V)",
-             level ? "LED ON" : "LED OFF");
-}
-
-static void _test_blink(int count, int on_ms, int off_ms)
-{
-    ESP_LOGI(TAG, "[TEST] BLINK x%d  (%d ms ON / %d ms OFF)", count, on_ms, off_ms);
-    for (int i = 0; i < count; i++) {
-        _test_pin_set(1);
-        vTaskDelay(pdMS_TO_TICKS(on_ms));
-        _test_pin_set(0);
-        vTaskDelay(pdMS_TO_TICKS(off_ms));
-    }
-}
-
-static void _test_hold(int level, int duration_ms)
-{
-    ESP_LOGI(TAG, "[TEST] HOLD %s for %d ms", level ? "HIGH" : "LOW", duration_ms);
-    _test_pin_set(level);
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
-}
-
-void app_main(void)
-{
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, " GPIO 27 OUTPUT TEST                    ");
-    ESP_LOGI(TAG, " Normal firmware is disabled.           ");
-    ESP_LOGI(TAG, " Circuit: GPIO27 -> 330Ohm -> LED -> GND");
-    ESP_LOGI(TAG, "========================================");
-
-    /* Configure GPIO 27 (MOTOR_PIN_IN1) as output, start LOW */
-    gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << MOTOR_PIN_IN1),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&cfg));
-    gpio_set_level(MOTOR_PIN_IN1, 0);
-    ESP_LOGI(TAG, "[TEST] GPIO %d configured as output, starting LOW", MOTOR_PIN_IN1);
-
-    for (;;) {
-        ESP_LOGI(TAG, "[TEST] === Cycle start ===");
-        _test_blink(5, 500, 500);   /* Phase 1: slow blink  — confirms toggle    */
-        _test_hold(1, 3000);        /* Phase 2: hold HIGH   — confirms sustained */
-        _test_hold(0, 2000);        /* Phase 3: hold LOW    — confirms clean GND */
-        _test_blink(10, 100, 100);  /* Phase 4: fast blink  — confirms switching */
-        ESP_LOGI(TAG, "[TEST] === Cycle done, restarting in 1 s ===");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-/* ================================================================
-   END TEST BLOCK — set TEST_GPIO27 0 to restore normal firmware
-   ================================================================ */
-#else  /* normal Plantagochi firmware */
-
 /* ----------------------------------------------------------------
    APP MAIN
    ---------------------------------------------------------------- */
@@ -2656,5 +2564,3 @@ void app_main(void)
     ESP_LOGI(TAG, "For Flask image analysis: connect laptop to same AP,");
     ESP_LOGI(TAG, "update LAPTOP_IP to its 192.168.4.x address, rebuild.");
 }
-
-#endif /* TEST_GPIO27 */
