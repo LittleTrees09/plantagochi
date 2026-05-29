@@ -131,7 +131,10 @@
    GPIO  4   PIN_PUMP_NUTRIENT   Nutrient pump       (relay)
    GPIO 27   PIN_PH_DOWN         pH down pump        (relay)
    GPIO 33   PIN_PH_UP           pH up pump          (relay)
-   GPIO 14   MOTOR_PIN_EN        L298N motor ENA     (PWM 30 kHz, optional)
+   
+   OPTIONAL PWM OUTPUT
+   ──────────────────────────────────────────────────────────────
+   GPIO 14   MOTOR_PIN_EN        L298N motor ENA     (PWM 30 kHz)
 
    All output pins use GPIO_DRIVE_CAP_3 (max drive strength).
    All output durations are set via the *_ON_DURATION_MS defines above.
