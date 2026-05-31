@@ -189,20 +189,6 @@ All output pins are configured with **GPIO_DRIVE_CAP_3** (maximum drive strength
 #define MOTOR_PWM_DEFAULT   200   /* 0–255 */
 ```
 
-### GPIO 27 LED Test Mode
-
-A built-in test blinks an LED on GPIO 27 to verify the pin works before wiring a relay. Enable it in `main/main.c`:
-
-```c
-#define TEST_GPIO27 1   /* 0 = normal firmware, 1 = blink test */
-```
-
-Circuit: `GPIO 27 ── 330Ω ── LED(+) ── LED(−) ── GND`
-
-Set back to `0` before normal use.
-
----
-
 ## 7. Autocorrect
 
 Autocorrect is a background task that runs on the ESP32 and automatically fires the correct pump when a sensor value goes out of its healthy range — no button press needed.
