@@ -20,8 +20,8 @@
  *
  * ----------------------------------------------------------------
  * SENSORS (inputs)
- *   GPIO 34 — Water level sensor  (ADC1_CH6)
- *   GPIO 32 — pH sensor           (ADC1_CH4)
+ *   GPIO 32 — Water level sensor  (ADC1_CH4)
+ *   GPIO 34 — pH sensor           (ADC1_CH6)
  *   GPIO 21 — I2C SDA → ADS1115  (TDS/Nutrients)
  *   GPIO 22 — I2C SCL → ADS1115  (TDS/Nutrients)
  *
@@ -110,12 +110,10 @@
    ================================================================
    INPUTS
    ──────────────────────────────────────────────────────────────
-   GPIO 34   ADC1_CH6   Water level sensor          (analog in)
-   GPIO 32   ADC1_CH4   pH sensor — PH-4502C        (analog in)
+   GPIO 32   ADC1_CH4   Water level sensor          (analog in)
+   GPIO 34   ADC1_CH6   pH sensor — PH-4502C        (analog in)
    GPIO 21   I2C SDA    ADS1115 → TDS / nutrients   (I2C data)
    GPIO 22   I2C SCL    ADS1115 → TDS / nutrients   (I2C clock)
-
-   OUTPUTS
    ──────────────────────────────────────────────────────────────
    GPIO 25   PIN_PUMP_WATER      Add water pump      (relay)
    GPIO 26   PIN_PUMP_DRAIN      Remove water pump   (relay)
@@ -134,8 +132,8 @@
 /* ----------------------------------------------------------------
    PIN DEFINITIONS
    ---------------------------------------------------------------- */
-#define PIN_WATER   ADC_CHANNEL_6   /* GPIO 34 */
-#define PIN_PH      ADC_CHANNEL_4   /* GPIO 32 */
+#define PIN_WATER   ADC_CHANNEL_4   /* GPIO 32 — matches Arduino WATER_SENSOR_PIN 32 */
+#define PIN_PH      ADC_CHANNEL_6   /* GPIO 34 — matches Arduino PH_SENSOR_PIN 34   */
 
 #define PIN_PUMP_WATER      GPIO_NUM_25   /* Add Water */
 #define PIN_PUMP_DRAIN      GPIO_NUM_26   /* Remove Water */
@@ -852,7 +850,7 @@ static const char HTML_PAGE[] =
 "  return false;\n"
 "}\n"
 "const esp32_base_url   = \"\";    // keep empty — ESP32 serves itself\n"
-"const POLL_INTERVAL_MS = 30000; // poll sensors every 30 seconds\n"
+"const POLL_INTERVAL_MS = 5000;  // poll sensors every 5 s — matches sensor_task update rate\n"
 "\n"
 "/* ══════════════════════════════════════════════\n"
 "   DEV OVERRIDE\n"
@@ -1026,13 +1024,15 @@ static const char HTML_PAGE[] =
 "function getTdsStatus(v) {\n"
 "  var mn = currentCrop.sensors.tds.min, mx = currentCrop.sensors.tds.max;\n"
 "  if (v < mn*0.4 || v > mx*1.3) return \"critical\";\n"
-"  if (v < mn     || v > mx)     return \"low\";\n"
+"  if (v < mn) return \"low\";\n"
+"  if (v > mx) return \"high\";\n"
 "  return \"normal\";\n"
 "}\n"
 "function getPhStatus(v) {\n"
 "  var mn = currentCrop.sensors.ph.min, mx = currentCrop.sensors.ph.max;\n"
 "  if (v < mn-1.0 || v > mx+1.0) return \"critical\";\n"
-"  if (v < mn     || v > mx)     return \"low\";\n"
+"  if (v < mn) return \"low\";\n"
+"  if (v > mx) return \"high\";\n"
 "  return \"normal\";\n"
 "}\n"
 "\n"
@@ -1046,7 +1046,7 @@ static const char HTML_PAGE[] =
 "  if (hasCritical && badCount >= 2) return \"critical\";\n"
 "  if (badCount >= 2) return \"multi\";\n"
 "  if (wSt !== \"normal\") return \"thirsty\";\n"
-"  if (tSt !== \"normal\") return tdsValue > currentCrop.sensors.tds.max ? \"overfed\" : \"hungry\";\n"
+"  if (tSt !== \"normal\") return (tSt === \"high\" || tdsValue > currentCrop.sensors.tds.max) ? \"overfed\" : \"hungry\";\n"
 "  if (pSt !== \"normal\") return \"stressed\";\n"
 "  return \"happy\";\n"
 "}\n"
@@ -1188,9 +1188,9 @@ static const char HTML_PAGE[] =
 "/* ══════════════════════════════════════════════\n"
 "   SENSOR RENDER HELPERS\n"
 "══════════════════════════════════════════════ */\n"
-"function badgeText(s)  { return s===\"normal\"?\"Normal\":s===\"low\"?\"Low\":\"Critical\"; }\n"
-"function badgeClass(s) { return \"status-badge \"+(s===\"normal\"?\"status-normal\":s===\"low\"?\"status-low\":\"status-critical\"); }\n"
-"function barColor(s)   { return s===\"normal\"?\"#40916c\":s===\"low\"?\"#e09f3e\":\"#c1121f\"; }\n"
+"function badgeText(s)  { return s===\"normal\"?\"Normal\":s===\"low\"?\"Low\":s===\"high\"?\"High\":\"Critical\"; }\n"
+"function badgeClass(s) { return \"status-badge \"+(s===\"normal\"?\"status-normal\":s===\"critical\"?\"status-critical\":\"status-low\"); }\n"
+"function barColor(s)   { return s===\"normal\"?\"#40916c\":s===\"critical\"?\"#c1121f\":\"#e09f3e\"; }\n"
 "function clamp(v,a,b)  { return Math.min(Math.max(v,a),b); }\n"
 "\n"
 "function setSensor(cfg) {\n"
@@ -1266,8 +1266,8 @@ static const char HTML_PAGE[] =
 "  var tdsMax = Math.round(currentCrop.sensors.tds.max * 1.5);\n"
 "  document.getElementById(\"tdsMax\").textContent = tdsMax;\n"
 "\n"
-"  setSensor({ badgeId:\"waterBadge\", barId:\"waterBar\", textId:\"waterText\", value:waterLevel, max:100,    status:wSt, display:waterLevel,        unit:\"%\" });\n"
-"  setSensor({ badgeId:\"tdsBadge\",   barId:\"tdsBar\",   textId:\"tdsText\",   value:tdsValue,   max:tdsMax, status:tSt, display:tdsValue,           unit:\" ppm\" });\n"
+"  setSensor({ badgeId:\"waterBadge\", barId:\"waterBar\", textId:\"waterText\", value:waterLevel, max:100,    status:wSt, display:waterLevel.toFixed(1),        unit:\"%\" });\n"
+"  setSensor({ badgeId:\"tdsBadge\",   barId:\"tdsBar\",   textId:\"tdsText\",   value:tdsValue,   max:tdsMax, status:tSt, display:Math.round(tdsValue),           unit:\" ppm\" });\n"
 "  setSensor({ badgeId:\"phBadge\",    barId:\"phBar\",     textId:\"phText\",    value:phValue,    max:14,     status:pSt, display:phValue.toFixed(1), unit:\" pH\" });\n"
 "\n"
 "  var mood    = getMood(wSt, tSt, pSt, tdsValue);\n"
@@ -1395,12 +1395,30 @@ static const char HTML_PAGE[] =
 "/* ══════════════════════════════════════════════\n"
 "   ESP32 FETCH\n"
 "══════════════════════════════════════════════ */\n"
+"var _lastGood = null; // cache of last successful sensor reading\n"
+"\n"
 "function fetchSensorData() {\n"
 "  if (DEV.enabled) { renderDashboard(DEV.waterLevel, DEV.tdsValue, DEV.phValue); return; }\n"
 "  fetch(esp32_base_url + \"/data\")\n"
 "    .then(function(r){ return r.json(); })\n"
-"    .then(function(d){ renderDashboard(Number(d.water)||0, Number(d.food)||0, Number(d.ph)||0); })\n"
-"    .catch(function(){ renderDashboard(DEMO.waterLevel, DEMO.tdsValue, DEMO.phValue); });\n"
+"    .then(function(d){\n"
+"      var w = Number(d.water), f = Number(d.food), p = Number(d.ph);\n"
+"      // Guard against NaN — fall back to 0 only per-field, not globally\n"
+"      w = isNaN(w) ? 0 : w;\n"
+"      f = isNaN(f) ? 0 : f;\n"
+"      p = isNaN(p) ? 0 : p;\n"
+"      _lastGood = { w: w, f: f, p: p };\n"
+"      document.getElementById(\"alertClose\") && document.getElementById(\"connectionWarn\") && document.getElementById(\"connectionWarn\").remove();\n"
+"      renderDashboard(w, f, p);\n"
+"    })\n"
+"    .catch(function(){\n"
+"      // Keep displaying the last good reading instead of going to zero\n"
+"      if (_lastGood) {\n"
+"        renderDashboard(_lastGood.w, _lastGood.f, _lastGood.p);\n"
+"      } else {\n"
+"        renderDashboard(DEMO.waterLevel, DEMO.tdsValue, DEMO.phValue);\n"
+"      }\n"
+"    });\n"
 "}\n"
 "\n"
 "/* ══════════════════════════════════════════════\n"
@@ -1662,7 +1680,7 @@ static const char HTML_PAGE[] =
 "else document.getElementById(\"previewBar\").setAttribute(\"hidden\",\"\");\n"
 "\n"
 "if (DEV.enabled) renderDashboard(DEV.waterLevel, DEV.tdsValue, DEV.phValue);\n"
-"else             renderDashboard(DEMO.waterLevel, DEMO.tdsValue, DEMO.phValue);\n"
+"// else: no initial render with zeros — fetchSensorData() below will fill the display\n"
 "\n"
 "fetchSensorData();\n"
 "setInterval(fetchSensorData, POLL_INTERVAL_MS);\n"
@@ -1778,7 +1796,7 @@ static void adc_init(void)
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, PIN_WATER, &chan_cfg));
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, PIN_PH,    &chan_cfg));
 
-    ESP_LOGI(TAG, "ADC1 configured — channels: water(GPIO34), pH(GPIO32)");
+    ESP_LOGI(TAG, "ADC1 configured — channels: water(GPIO32/CH4), pH(GPIO34/CH6)");
 }
 
 /* ----------------------------------------------------------------
@@ -1914,8 +1932,11 @@ static float read_tds(void)
 }
 
 /* Returns pH value (0–14).
-   Collects 10 ADC samples, bubble-sorts, averages the 6 middle values,
-   then converts: pH = (−5.70 × volt) + 22.84
+   Collects 10 ADC samples, bubble-sorts, sums the 6 middle values,
+   then converts using the same formula as the Arduino PH-4502C sketch:
+     volt = (sum_of_6 * 3.3) / (4095.0 * 6)
+     pH   = (-5.70 * volt) + 24.25
+   The intercept 24.25 matches calibration_value from the Arduino code.
    Simulated: ~6.1 ±0.3. */
 static float read_ph(void)
 {
@@ -1943,13 +1964,15 @@ static float read_ph(void)
         }
     }
 
-    /* Average middle 6 samples, discard 2 highest and 2 lowest */
+    /* Sum middle 6 samples (indices 2..7), discard 2 highest and 2 lowest.
+       Voltage formula mirrors Arduino: volt = (float)avgval * 3.3 / 4095.0 / 6
+       where avgval is the raw sum (not yet divided by 6). */
     long sum = 0;
     for (int i = 2; i < 8; i++) sum += buf[i];
-    float avg_adc = (float)sum / 6.0f;
 
-    float volt = avg_adc * (3.3f / 4095.0f);
-    float ph   = (-5.70f * volt) + 22.84f;
+    /* sum * 3.3 / (4095 * 6) is identical to (sum/6) * (3.3/4095) */
+    float volt = (float)sum * 3.3f / (4095.0f * 6.0f);
+    float ph   = (-5.70f * volt) + 24.25f;   /* 24.25 = calibration_value from Arduino */
 
     if (ph < 0.0f)  ph = 0.0f;
     if (ph > 14.0f) ph = 14.0f;
@@ -2249,7 +2272,8 @@ static esp_err_t handler_data(httpd_req_t *req)
         ph    = s_cache.ph;
         xSemaphoreGive(s_cache_mutex);
     } else {
-        water = 0.0f; food = 0.0f; ph = 0.0f;
+        /* Mutex unavailable — return the static defaults rather than zeros */
+        water = 72.0f; food = 700.0f; ph = 6.1f;
     }
 
     char json[128];
